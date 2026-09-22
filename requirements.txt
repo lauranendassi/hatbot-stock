@@ -1,3 +1,5 @@
-flask
-openpyxl
+Flask
+requests
 gunicorn
+psycopg2-binary
+openpyxl
