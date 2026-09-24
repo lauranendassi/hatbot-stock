@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
-"""Bot Messenger WeloobeAI — Version IA Groq robuste.
-   Ne plante jamais : toutes les exceptions sont catchées.
+"""Bot Messenger WeloobeAI — Version IA Groq robuste anti-hallucination.
+   L'IA ne propose JAMAIS de produits absents du catalogue.
 """
 import os
 import json
@@ -21,7 +21,7 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "weloobe_verify_2026_secure")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
-# Modèles Groq — par ordre de préférence (fallback automatique)
+# Modeles Groq par ordre de preference (fallback automatique)
 MODELES_GROQ = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
@@ -75,7 +75,6 @@ def db():
 
 
 def log(prefixe, message):
-    """Log uniforme et lisible."""
     try:
         print("[{}] {}".format(prefixe, str(message)[:500]))
     except Exception:
@@ -86,7 +85,8 @@ def log(prefixe, message):
 # OUTILS POUR L'IA
 # ====================================================================
 def chercher_produits(requete="", budget_max=0, categorie=""):
-    """Cherche des produits. Ne plante jamais."""
+    """Cherche des produits. Ne plante jamais.
+       Retourne toujours une liste avec message explicite si vide."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -96,7 +96,7 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
         conn.close()
     except Exception as e:
         log("ERR", "chercher_produits DB: " + str(e))
-        return [{"info": "Base momentanement indisponible"}]
+        return [{"erreur": "Base momentanement indisponible"}]
 
     try:
         resultats = []
@@ -127,16 +127,27 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
 
         resultats.sort(key=lambda x: -x.get("score", 0))
         top = resultats[:5]
+
+        # Cas vide : renvoyer un message CLAIR et NON EQUIVOQUE a l'IA
         if not top:
-            return [{"info": "Aucun produit ne correspond a ces criteres"}]
+            prix_min = min((p.get("prix_vente") or 0) for p in tous) if tous else 0
+            return [{
+                "aucun_resultat": True,
+                "message": "AUCUN PRODUIT du catalogue ne correspond a cette recherche.",
+                "budget_demande": budget_max,
+                "categorie_demandee": categorie,
+                "prix_minimum_catalogue": prix_min,
+                "instruction": "Dis honnetement au client qu'aucun produit ne correspond. Propose UNIQUEMENT d'elargir le budget ou de voir une autre categorie REELLE du catalogue (Ecran, Composant, Accessoire). N'invente AUCUN produit."
+            }]
+
         return top
     except Exception as e:
         log("ERR", "chercher_produits traitement: " + str(e))
-        return [{"info": "Erreur lors de la recherche"}]
+        return [{"erreur": "Erreur lors de la recherche"}]
 
 
 def verifier_stock(sku):
-    """Verifie le stock. Ne plante jamais."""
+    """Verifie le stock d'un produit. Ne plante jamais."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -147,7 +158,7 @@ def verifier_stock(sku):
         cur.close()
         conn.close()
         if not p:
-            return {"erreur": "Produit inconnu"}
+            return {"erreur": "Produit inconnu dans le catalogue"}
         stock = (p.get("stock_initial") or 0) - (vendu.get("q") or 0)
         return {
             "sku": sku,
@@ -170,6 +181,8 @@ def lister_catalogue():
         produits = cur.fetchall()
         cur.close()
         conn.close()
+        if not produits:
+            return [{"info": "Catalogue vide"}]
         return [{
             "sku": p.get("sku"),
             "nom": p.get("nom"),
@@ -178,7 +191,7 @@ def lister_catalogue():
         } for p in produits]
     except Exception as e:
         log("ERR", "lister_catalogue: " + str(e))
-        return [{"info": "Catalogue indisponible"}]
+        return [{"erreur": "Catalogue indisponible"}]
 
 
 OUTILS = [
@@ -186,13 +199,13 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "chercher_produits",
-            "description": "Cherche des produits dans le catalogue selon le besoin du client",
+            "description": "Cherche des produits dans le catalogue WeloobeAI. Retourne UNIQUEMENT les produits existants. Si aucun ne correspond, indique-le clairement.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "requete": {"type": "string", "description": "Mots-cles (ex: 'pc portable', 'ecran')"},
                     "budget_max": {"type": "number", "description": "Budget maximum en FCFA (0 si non specifie)"},
-                    "categorie": {"type": "string", "description": "Categorie : PC portable, PC fixe, Ecran, Composant, Accessoire"}
+                    "categorie": {"type": "string", "description": "Categorie EXACTE parmi : PC portable, PC fixe, Ecran, Composant, Accessoire"}
                 }
             }
         }
@@ -213,7 +226,7 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "lister_catalogue",
-            "description": "Liste tous les produits du catalogue",
+            "description": "Liste TOUS les produits du catalogue WeloobeAI",
             "parameters": {"type": "object", "properties": {}}
         }
     }
@@ -258,32 +271,49 @@ def enregistrer_message(psid, role, contenu):
 
 
 # ====================================================================
-# REPONSE IA
+# SYSTEM PROMPT — ANTI-HALLUCINATION
 # ====================================================================
 SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde (Cameroun).
 
-Ton role :
+=== REGLE ABSOLUE ET NON NEGOCIABLE ===
+Tu ne dois JAMAIS inventer, suggerer, ou mentionner un produit, un modele, une marque, une categorie ou un prix qui ne vient PAS d'un appel d'outil.
+
+INTERDICTIONS STRICTES :
+- Ne JAMAIS mentionner : Chromebook, tablette, iPad, reconditionne, occasion, pack etudiant, partenaire externe, produits d'autres marques non listes.
+- Ne JAMAIS inventer de prix.
+- Ne JAMAIS proposer un produit si l'outil chercher_produits a retourne "aucun_resultat".
+
+SI L'OUTIL RETOURNE "aucun_resultat" :
+Tu dois dire HONNETEMENT au client :
+1. Qu'aucun produit du catalogue ne correspond a sa recherche
+2. Le prix du produit le moins cher du catalogue (fourni dans le champ "prix_minimum_catalogue")
+3. Proposer UNIQUEMENT ces options REELLES :
+   - Elargir le budget
+   - Voir une autre categorie REELLE du catalogue : Ecran, Composant, Accessoire
+   - Laisser ses coordonnees pour etre rappele
+
+=== TON ROLE ===
 - Accueillir chaleureusement les clients
-- Comprendre leur besoin en posant des questions si necessaire
-- Leur proposer les produits adaptes du catalogue
-- Donner les prix en FCFA
-- Verifier la disponibilite
+- Comprendre leur besoin
+- Proposer UNIQUEMENT les produits retournes par chercher_produits
+- Donner les prix EXACTEMENT tels qu'ils viennent de la base
+- Verifier la disponibilite avec verifier_stock
 
-Regles :
-- Sois naturel, amical et professionnel
-- Utilise des emojis avec moderation
-- Si le client exprime un besoin, utilise l'outil chercher_produits
-- Si le client demande un produit precis, utilise verifier_stock
-- Si le client veut voir tout le catalogue, utilise lister_catalogue
-- Ne invente JAMAIS de produits ou de prix : utilise TOUJOURS les outils
-- Reponds en francais
-- Si aucun produit ne correspond, propose d'elargir le budget ou de voir d'autres categories
+=== STYLE ===
+- Naturel, amical, professionnel
+- Emojis avec moderation
+- Reponds toujours en francais
 
-Categories disponibles : PC portable, PC fixe, Ecran, Composant, Accessoire."""
+=== CATEGORIES REELLES DU CATALOGUE ===
+- PC portable
+- PC fixe
+- Ecran
+- Composant
+- Accessoire"""
 
 
 def appeler_ia(messages, avec_outils=True):
-    """Appelle Groq avec fallback sur plusieurs modeles. Retourne la reponse ou None."""
+    """Appelle Groq avec fallback sur plusieurs modeles."""
     if not client_ia:
         return None
 
@@ -292,7 +322,7 @@ def appeler_ia(messages, avec_outils=True):
             kwargs = {
                 "model": modele,
                 "messages": messages,
-                "temperature": 0.7,
+                "temperature": 0.5,
                 "max_tokens": 500
             }
             if avec_outils:
@@ -392,7 +422,9 @@ def repondre_avec_ia(psid, message_client):
             response2 = appeler_ia(messages, avec_outils=False)
             if response2:
                 try:
-                    return response2.choices[0].message.content or "Je n'ai pas de reponse."
+                    contenu = response2.choices[0].message.content
+                    if contenu:
+                        return contenu
                 except Exception:
                     pass
 
@@ -415,7 +447,6 @@ def envoyer_message(psid, texte):
     try:
         url = "https://graph.facebook.com/v20.0/me/messages"
         params = {"access_token": PAGE_ACCESS_TOKEN}
-        # Tronquer si trop long (limite Messenger ~2000 chars)
         texte = (texte or "")[:1900]
         payload = {"recipient": {"id": psid}, "message": {"text": texte}}
         r = requests.post(url, params=params, json=payload, timeout=10)
@@ -457,7 +488,7 @@ def webhook_verification():
 
 @app.route("/webhook", methods=["POST"])
 def webhook_reception():
-    """Recoit les evenements. Ne plante JAMAIS, peu importe l'erreur."""
+    """Recoit les evenements. Ne plante JAMAIS."""
     try:
         data = request.get_json(silent=True) or {}
         if data.get("object") != "page":
@@ -545,7 +576,6 @@ def init_database():
             )
         """)
 
-        # Securiser les colonnes si la table existait deja
         for alter in [
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS role TEXT",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp TEXT",
@@ -596,7 +626,6 @@ def init_database():
         log("ERR", "init_database: " + str(e))
 
 
-# Initialisation au demarrage
 try:
     init_database()
 except Exception as e:
