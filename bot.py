@@ -25,7 +25,7 @@ client_ia = OpenAI(
     api_key=GROQ_API_KEY
 )
 
-MODELE = "llama-3.3-70b-versatile"
+MODELE = "openai/gpt-oss-120b"
 
 
 # ====================================================================
