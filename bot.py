@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Bot Messenger WeloobeAI — Version IA générative (Groq)"""
+"""Bot Messenger WeloobeAI — Version IA Groq robuste.
+   Ne plante jamais : toutes les exceptions sont catchées.
+"""
 import os
+import json
 import datetime
 import unicodedata
+import traceback
 import requests
 import psycopg2
 import psycopg2.extras
@@ -17,98 +21,166 @@ VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "weloobe_verify_2026_secure")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
+# Modèles Groq — par ordre de préférence (fallback automatique)
+MODELES_GROQ = [
+    "openai/gpt-oss-120b",
+    "openai/gpt-oss-20b",
+    "llama-3.1-8b-instant",
+    "llama-3.1-70b-versatile",
+]
+
 app = Flask(__name__)
 
-# Client Groq (compatible OpenAI)
-client_ia = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    api_key=GROQ_API_KEY
-)
-
-MODELE = "openai/gpt-oss-120b"
+client_ia = None
+if GROQ_API_KEY:
+    try:
+        client_ia = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=GROQ_API_KEY
+        )
+    except Exception as e:
+        print("Erreur init Groq :", e)
 
 
 # ====================================================================
 # UTILITAIRES
 # ====================================================================
 def normaliser(s):
-    s = (s or "").lower()
-    s = unicodedata.normalize("NFD", s)
-    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
-    for ch in "—–-_,.;:!?()[]'\"/\\":
-        s = s.replace(ch, " ")
-    return " ".join(s.split())
+    try:
+        s = (s or "").lower()
+        s = unicodedata.normalize("NFD", s)
+        s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+        for ch in "—–-_,.;:!?()[]'\"/\\":
+            s = s.replace(ch, " ")
+        return " ".join(s.split())
+    except Exception:
+        return ""
 
 
 def f(n):
-    return "{:,}".format(int(n)).replace(",", " ") + " FCFA"
+    try:
+        return "{:,}".format(int(n)).replace(",", " ") + " FCFA"
+    except Exception:
+        return "0 FCFA"
 
 
 def db():
+    if not DATABASE_URL:
+        raise Exception("DATABASE_URL non configuree")
     return psycopg2.connect(
         DATABASE_URL,
-        cursor_factory=psycopg2.extras.RealDictCursor
+        cursor_factory=psycopg2.extras.RealDictCursor,
+        connect_timeout=10
     )
 
 
+def log(prefixe, message):
+    """Log uniforme et lisible."""
+    try:
+        print("[{}] {}".format(prefixe, str(message)[:500]))
+    except Exception:
+        pass
+
+
 # ====================================================================
-# OUTILS POUR L'IA (function calling)
+# OUTILS POUR L'IA
 # ====================================================================
 def chercher_produits(requete="", budget_max=0, categorie=""):
-    """Cherche des produits dans la base selon des critères."""
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM produits")
-    tous = cur.fetchall()
-    cur.close()
-    conn.close()
+    """Cherche des produits. Ne plante jamais."""
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM produits")
+        tous = cur.fetchall()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log("ERR", "chercher_produits DB: " + str(e))
+        return [{"info": "Base momentanement indisponible"}]
 
-    resultats = []
-    tokens = normaliser(requete).split()
+    try:
+        resultats = []
+        tokens = normaliser(requete).split()
+        try:
+            budget_max = float(budget_max) if budget_max else 0
+        except Exception:
+            budget_max = 0
 
-    for p in tous:
-        hay = normaliser(p["nom"] + " " + (p["categorie"] or ""))
-        # Score de correspondance
-        score = sum(len(t) for t in tokens if t in hay)
-        if categorie and categorie.lower() not in (p["categorie"] or "").lower():
-            continue
-        if budget_max and p["prix_vente"] > budget_max:
-            continue
-        if not tokens or score > 0:
-            resultats.append({**p, "score": score})
+        for p in tous:
+            try:
+                hay = normaliser((p.get("nom") or "") + " " + (p.get("categorie") or ""))
+                score = sum(len(t) for t in tokens if t in hay)
+                if categorie and categorie.lower() not in (p.get("categorie") or "").lower():
+                    continue
+                if budget_max and (p.get("prix_vente") or 0) > budget_max:
+                    continue
+                if not tokens or score > 0:
+                    resultats.append({
+                        "sku": p.get("sku"),
+                        "nom": p.get("nom"),
+                        "categorie": p.get("categorie"),
+                        "prix": p.get("prix_vente"),
+                        "score": score
+                    })
+            except Exception:
+                continue
 
-    resultats.sort(key=lambda x: -x.get("score", 0))
-    return resultats[:5]
+        resultats.sort(key=lambda x: -x.get("score", 0))
+        top = resultats[:5]
+        if not top:
+            return [{"info": "Aucun produit ne correspond a ces criteres"}]
+        return top
+    except Exception as e:
+        log("ERR", "chercher_produits traitement: " + str(e))
+        return [{"info": "Erreur lors de la recherche"}]
 
 
 def verifier_stock(sku):
-    """Vérifie le stock d'un produit."""
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM produits WHERE sku = %s", (sku,))
-    p = cur.fetchone()
-    cur.execute("SELECT COALESCE(SUM(quantite), 0) AS q FROM ventes WHERE sku = %s", (sku,))
-    vendu = cur.fetchone()
-    cur.close()
-    conn.close()
-    if not p:
-        return None
-    stock = (p["stock_initial"] or 0) - (vendu["q"] or 0)
-    return {"sku": sku, "nom": p["nom"], "stock": stock, "prix": p["prix_vente"]}
+    """Verifie le stock. Ne plante jamais."""
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM produits WHERE sku = %s", (sku,))
+        p = cur.fetchone()
+        cur.execute("SELECT COALESCE(SUM(quantite), 0) AS q FROM ventes WHERE sku = %s", (sku,))
+        vendu = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not p:
+            return {"erreur": "Produit inconnu"}
+        stock = (p.get("stock_initial") or 0) - (vendu.get("q") or 0)
+        return {
+            "sku": sku,
+            "nom": p.get("nom"),
+            "stock": stock,
+            "prix": p.get("prix_vente"),
+            "disponible": stock > 0
+        }
+    except Exception as e:
+        log("ERR", "verifier_stock: " + str(e))
+        return {"erreur": "Impossible de verifier le stock"}
 
 
 def lister_catalogue():
-    """Liste tous les produits disponibles."""
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM produits ORDER BY categorie, nom")
-    produits = cur.fetchall()
-    cur.close()
-    conn.close()
-    return [dict(p) for p in produits]
+    """Liste tout le catalogue. Ne plante jamais."""
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM produits ORDER BY categorie, nom")
+        produits = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{
+            "sku": p.get("sku"),
+            "nom": p.get("nom"),
+            "categorie": p.get("categorie"),
+            "prix": p.get("prix_vente")
+        } for p in produits]
+    except Exception as e:
+        log("ERR", "lister_catalogue: " + str(e))
+        return [{"info": "Catalogue indisponible"}]
 
 
-# Définition des outils pour Groq
 OUTILS = [
     {
         "type": "function",
@@ -118,9 +190,9 @@ OUTILS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "requete": {"type": "string", "description": "Mots-clés de recherche (ex: 'pc portable', 'écran')"},
-                    "budget_max": {"type": "number", "description": "Budget maximum du client en FCFA"},
-                    "categorie": {"type": "string", "description": "Catégorie : PC portable, PC fixe, Écran, Composant, Accessoire"}
+                    "requete": {"type": "string", "description": "Mots-cles (ex: 'pc portable', 'ecran')"},
+                    "budget_max": {"type": "number", "description": "Budget maximum en FCFA (0 si non specifie)"},
+                    "categorie": {"type": "string", "description": "Categorie : PC portable, PC fixe, Ecran, Composant, Accessoire"}
                 }
             }
         }
@@ -129,12 +201,10 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "verifier_stock",
-            "description": "Vérifie la disponibilité d'un produit par son SKU",
+            "description": "Verifie la disponibilite d'un produit par son SKU",
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "sku": {"type": "string", "description": "Code SKU du produit"}
-                },
+                "properties": {"sku": {"type": "string"}},
                 "required": ["sku"]
             }
         }
@@ -151,10 +221,9 @@ OUTILS = [
 
 
 # ====================================================================
-# HISTORIQUE DE CONVERSATION
+# HISTORIQUE
 # ====================================================================
 def charger_historique(psid, limite=10):
-    """Charge les derniers messages échangés avec ce client."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -166,11 +235,10 @@ def charger_historique(psid, limite=10):
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        # Remettre dans l'ordre chronologique
         rows = list(reversed(rows))
-        return [{"role": r["role"], "content": r["contenu"]} for r in rows]
+        return [{"role": r.get("role") or "user", "content": r.get("contenu") or ""} for r in rows]
     except Exception as e:
-        print("Erreur chargement historique :", e)
+        log("WARN", "charger_historique: " + str(e))
         return []
 
 
@@ -180,120 +248,181 @@ def enregistrer_message(psid, role, contenu):
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO messages (psid, role, contenu, timestamp) VALUES (%s, %s, %s, %s)",
-            (psid, role, contenu, datetime.datetime.now().isoformat())
+            (psid, role, contenu or "", datetime.datetime.now().isoformat())
         )
         conn.commit()
         cur.close()
         conn.close()
     except Exception as e:
-        print("Erreur enregistrement :", e)
+        log("WARN", "enregistrer_message: " + str(e))
 
 
 # ====================================================================
-# LOGIQUE PRINCIPALE
+# REPONSE IA
 # ====================================================================
-def repondre_avec_ia(psid, message_client):
-    """Génère une réponse intelligente via Groq."""
+SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde (Cameroun).
 
-    # Système : personnalité du bot
-    system_prompt = """Tu es l'assistant commercial de WeloobeAI, magasin de matériel informatique à Yaoundé (Cameroun).
-
-Ton rôle :
+Ton role :
 - Accueillir chaleureusement les clients
-- Comprendre leur besoin en posant des questions si nécessaire
-- Leur proposer les produits adaptés de notre catalogue
+- Comprendre leur besoin en posant des questions si necessaire
+- Leur proposer les produits adaptes du catalogue
 - Donner les prix en FCFA
-- Vérifier la disponibilité
+- Verifier la disponibilite
 
-Règles :
+Regles :
 - Sois naturel, amical et professionnel
-- Utilise des emojis avec modération
+- Utilise des emojis avec moderation
 - Si le client exprime un besoin, utilise l'outil chercher_produits
-- Si le client demande un produit précis, utilise verifier_stock
+- Si le client demande un produit precis, utilise verifier_stock
 - Si le client veut voir tout le catalogue, utilise lister_catalogue
-- Ne invente JAMAIS de produits ou de prix : utilise toujours les outils
-- Réponds en français
+- Ne invente JAMAIS de produits ou de prix : utilise TOUJOURS les outils
+- Reponds en francais
+- Si aucun produit ne correspond, propose d'elargir le budget ou de voir d'autres categories
 
-Produits disponibles : ordinateurs portables, PC fixes, écrans, composants, accessoires."""
+Categories disponibles : PC portable, PC fixe, Ecran, Composant, Accessoire."""
 
-    # Historique
-    historique = charger_historique(psid, limite=10)
 
-    messages = [
-        {"role": "system", "content": system_prompt},
-        *historique,
-        {"role": "user", "content": message_client}
-    ]
+def appeler_ia(messages, avec_outils=True):
+    """Appelle Groq avec fallback sur plusieurs modeles. Retourne la reponse ou None."""
+    if not client_ia:
+        return None
+
+    for modele in MODELES_GROQ:
+        try:
+            kwargs = {
+                "model": modele,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 500
+            }
+            if avec_outils:
+                kwargs["tools"] = OUTILS
+                kwargs["tool_choice"] = "auto"
+
+            response = client_ia.chat.completions.create(**kwargs)
+            log("IA", "Modele utilise : " + modele)
+            return response
+        except Exception as e:
+            log("WARN", "Modele {} echoue : {}".format(modele, str(e)[:200]))
+            continue
+    return None
+
+
+def executer_outil(nom, args):
+    """Execute un outil avec gestion d'erreur."""
+    try:
+        if nom == "chercher_produits":
+            return chercher_produits(
+                args.get("requete", ""),
+                args.get("budget_max", 0),
+                args.get("categorie", "")
+            )
+        elif nom == "verifier_stock":
+            return verifier_stock(args.get("sku", ""))
+        elif nom == "lister_catalogue":
+            return lister_catalogue()
+        return {"erreur": "outil inconnu"}
+    except Exception as e:
+        log("ERR", "executer_outil: " + str(e))
+        return {"erreur": "Erreur execution outil"}
+
+
+def repondre_avec_ia(psid, message_client):
+    """Genere une reponse. Ne plante jamais."""
+
+    if not client_ia:
+        return "Bonjour ! Je suis l'assistant WeloobeAI. Le service est en cours de configuration, merci de reessayer dans quelques instants."
 
     try:
-        # Premier appel : l'IA décide si elle doit utiliser un outil
-        response = client_ia.chat.completions.create(
-            model=MODELE,
-            messages=messages,
-            tools=OUTILS,
-            tool_choice="auto",
-            temperature=0.7,
-            max_tokens=500
-        )
+        historique = charger_historique(psid, limite=10)
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(historique)
+        messages.append({"role": "user", "content": message_client})
 
-        msg = response.choices[0].message
+        # Premier appel
+        response = appeler_ia(messages, avec_outils=True)
+        if not response:
+            return "Je rencontre un souci technique. Pouvez-vous reformuler ?"
 
-        # Si l'IA veut appeler un outil
-        if msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                nom_outil = tool_call.function.name
-                args = eval(tool_call.function.arguments) if tool_call.function.arguments else {}
+        try:
+            msg = response.choices[0].message
+        except Exception:
+            return "Je n'ai pas bien compris. Pouvez-vous reformuler ?"
 
-                print("  Outil appelé : {} ({})".format(nom_outil, args))
+        # Appel d'outils
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    } for tc in tool_calls
+                ]
+            })
 
-                # Exécuter l'outil
-                if nom_outil == "chercher_produits":
-                    resultat = chercher_produits(
-                        args.get("requete", ""),
-                        args.get("budget_max", 0),
-                        args.get("categorie", "")
-                    )
-                elif nom_outil == "verifier_stock":
-                    resultat = verifier_stock(args.get("sku", ""))
-                elif nom_outil == "lister_catalogue":
-                    resultat = lister_catalogue()
-                else:
-                    resultat = {"erreur": "outil inconnu"}
+            for tool_call in tool_calls:
+                try:
+                    nom_outil = tool_call.function.name
+                    args_str = tool_call.function.arguments or "{}"
+                    try:
+                        args = json.loads(args_str)
+                    except Exception:
+                        args = {}
 
-                # Renvoyer le résultat à l'IA
-                messages.append(msg)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": str(resultat)
-                })
+                    log("OUTIL", "{} ({})".format(nom_outil, args))
+                    resultat = executer_outil(nom_outil, args)
 
-            # Deuxième appel : l'IA formule la réponse finale
-            response2 = client_ia.chat.completions.create(
-                model=MODELE,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=500
-            )
-            return response2.choices[0].message.content
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": json.dumps(resultat, ensure_ascii=False, default=str)
+                    })
+                except Exception as e:
+                    log("ERR", "traitement tool_call: " + str(e))
+                    continue
 
-        return msg.content
+            # Deuxieme appel pour formuler la reponse finale
+            response2 = appeler_ia(messages, avec_outils=False)
+            if response2:
+                try:
+                    return response2.choices[0].message.content or "Je n'ai pas de reponse."
+                except Exception:
+                    pass
+
+            return "J'ai trouve des produits mais je n'arrive pas a formuler la reponse. Reformulez svp."
+
+        # Reponse directe
+        return msg.content or "Je n'ai pas bien compris."
 
     except Exception as e:
-        print("Erreur IA :", e)
-        return "Désolé, je rencontre un petit souci technique. Pouvez-vous reformuler votre demande ?"
+        log("ERR", "repondre_avec_ia: " + str(e))
+        log("ERR", traceback.format_exc()[:500])
+        return "Je rencontre un souci technique. Pouvez-vous reformuler votre demande ?"
 
 
 def envoyer_message(psid, texte):
-    url = "https://graph.facebook.com/v20.0/me/messages"
-    params = {"access_token": PAGE_ACCESS_TOKEN}
-    payload = {"recipient": {"id": psid}, "message": {"text": texte}}
+    """Envoie un message a Messenger. Ne plante jamais."""
+    if not PAGE_ACCESS_TOKEN:
+        log("ERR", "PAGE_ACCESS_TOKEN manquant")
+        return False
     try:
+        url = "https://graph.facebook.com/v20.0/me/messages"
+        params = {"access_token": PAGE_ACCESS_TOKEN}
+        # Tronquer si trop long (limite Messenger ~2000 chars)
+        texte = (texte or "")[:1900]
+        payload = {"recipient": {"id": psid}, "message": {"text": texte}}
         r = requests.post(url, params=params, json=payload, timeout=10)
-        print("  Envoi :", r.status_code)
+        log("ENVOI", "{} - {}".format(r.status_code, texte[:60]))
         return r.status_code == 200
     except Exception as e:
-        print("  Erreur envoi :", e)
+        log("ERR", "envoyer_message: " + str(e))
         return False
 
 
@@ -302,49 +431,77 @@ def envoyer_message(psid, texte):
 # ====================================================================
 @app.route("/", methods=["GET"])
 def accueil():
-    return jsonify({"status": "ok", "bot": "WeloobeAI Chatbot IA"})
+    return jsonify({
+        "status": "ok",
+        "bot": "WeloobeAI Chatbot IA",
+        "ia": "connectee" if client_ia else "non configuree",
+        "db": "connectee" if DATABASE_URL else "non configuree"
+    })
 
 
 @app.route("/webhook", methods=["GET"])
 def webhook_verification():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        return challenge, 200
-    return "Forbidden", 403
+    try:
+        mode = request.args.get("hub.mode")
+        token = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and token == VERIFY_TOKEN:
+            log("WEBHOOK", "Verification OK")
+            return challenge or "", 200
+        log("WEBHOOK", "Verification echouee")
+        return "Forbidden", 403
+    except Exception as e:
+        log("ERR", "webhook_verification: " + str(e))
+        return "Forbidden", 403
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook_reception():
-    data = request.get_json()
-    if data.get("object") != "page":
-        return "Not a page event", 404
+    """Recoit les evenements. Ne plante JAMAIS, peu importe l'erreur."""
+    try:
+        data = request.get_json(silent=True) or {}
+        if data.get("object") != "page":
+            return "Not a page event", 404
 
-    for entry in data.get("entry", []):
-        for event in entry.get("messaging", []):
-            psid = event.get("sender", {}).get("id")
-            texte = event.get("message", {}).get("text", "")
-            if not psid or not texte:
-                continue
+        for entry in data.get("entry", []):
+            for event in entry.get("messaging", []):
+                try:
+                    psid = event.get("sender", {}).get("id")
+                    texte = event.get("message", {}).get("text", "")
+                    if not psid or not texte:
+                        continue
 
-            print("Message de {} : {}".format(psid, texte))
-            enregistrer_message(psid, "user", texte)
+                    log("RECU", "{} : {}".format(psid, texte))
+                    enregistrer_message(psid, "user", texte)
 
-            try:
-                reponse = repondre_avec_ia(psid, texte)
-                enregistrer_message(psid, "assistant", reponse)
-                envoyer_message(psid, reponse)
-            except Exception as e:
-                print("Erreur traitement :", e)
+                    reponse = repondre_avec_ia(psid, texte)
+                    if not reponse:
+                        reponse = "Je n'ai pas de reponse pour le moment."
 
-    return "EVENT_RECEIVED", 200
+                    enregistrer_message(psid, "assistant", reponse)
+                    envoyer_message(psid, reponse)
+
+                except Exception as e:
+                    log("ERR", "traitement event: " + str(e))
+                    log("ERR", traceback.format_exc()[:500])
+                    continue
+
+        return "EVENT_RECEIVED", 200
+
+    except Exception as e:
+        log("ERR", "webhook_reception global: " + str(e))
+        return "EVENT_RECEIVED", 200
 
 
 # ====================================================================
 # INIT BASE
 # ====================================================================
 def init_database():
+    """Cree les tables. Ne plante jamais."""
+    if not DATABASE_URL:
+        log("WARN", "Pas de DATABASE_URL, base non initialisee")
+        return
+
     try:
         conn = db()
         cur = conn.cursor()
@@ -388,43 +545,71 @@ def init_database():
             )
         """)
 
+        # Securiser les colonnes si la table existait deja
+        for alter in [
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS role TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS psid TEXT",
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS contenu TEXT",
+        ]:
+            try:
+                cur.execute(alter)
+            except Exception as e:
+                log("WARN", "ALTER: " + str(e))
+
         conn.commit()
 
+        # Import des produits si table vide
         cur.execute("SELECT COUNT(*) AS n FROM produits")
-        if cur.fetchone()["n"] == 0:
+        row = cur.fetchone()
+        if (row.get("n") or 0) == 0:
             try:
                 from openpyxl import load_workbook
                 wb = load_workbook("Gestion_stock_corrige.xlsx", data_only=False)
                 ws = wb["Produits"]
+                importes = 0
                 for r in range(5, 105):
-                    sku = ws.cell(r, 1).value
-                    nom = ws.cell(r, 2).value
-                    if not sku or not nom:
+                    try:
+                        sku = ws.cell(r, 1).value
+                        nom = ws.cell(r, 2).value
+                        if not sku or not nom:
+                            continue
+                        cur.execute(
+                            "INSERT INTO produits (sku, nom, categorie, prix_achat, prix_vente, stock_initial, seuil) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (sku) DO NOTHING",
+                            (str(sku), str(nom), ws.cell(r, 11).value or "",
+                             int(ws.cell(r, 3).value or 0), int(ws.cell(r, 4).value or 0),
+                             int(ws.cell(r, 5).value or 0), int(ws.cell(r, 10).value or 2))
+                        )
+                        importes += 1
+                    except Exception:
                         continue
-                    cur.execute(
-                        "INSERT INTO produits (sku, nom, categorie, prix_achat, prix_vente, stock_initial, seuil) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (str(sku), str(nom), ws.cell(r, 11).value or "",
-                         int(ws.cell(r, 3).value or 0), int(ws.cell(r, 4).value or 0),
-                         int(ws.cell(r, 5).value or 0), int(ws.cell(r, 10).value or 2))
-                    )
                 conn.commit()
-                print("Produits importés.")
+                log("DB", "{} produits importes".format(importes))
             except Exception as e:
-                print("Erreur import Excel :", e)
+                log("WARN", "Import Excel: " + str(e))
 
         cur.close()
         conn.close()
+        log("DB", "Base initialisee")
     except Exception as e:
-        print("Erreur init :", e)
+        log("ERR", "init_database: " + str(e))
 
 
-init_database()
+# Initialisation au demarrage
+try:
+    init_database()
+except Exception as e:
+    log("ERR", "init_database global: " + str(e))
 
 
+# ====================================================================
+# LANCEMENT
+# ====================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Bot Messenger WeloobeAI — IA Groq")
-    print("  Modèle : " + MODELE)
+    print("  Bot Messenger WeloobeAI — IA Groq robuste")
+    print("  IA : {}".format("connectee" if client_ia else "NON"))
+    print("  DB : {}".format("connectee" if DATABASE_URL else "NON"))
     print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=False)
