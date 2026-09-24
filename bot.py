@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Bot Messenger WeloobeAI — Version IA Groq robuste anti-hallucination.
-   L'IA ne propose JAMAIS de produits absents du catalogue.
+"""Bot Messenger WeloobeAI — Version IA Groq robuste et naturelle.
+   - Anti-hallucination : l'IA ne propose que des produits reels
+   - Recherche produits amelioree : filtre par categorie, mots-cles, budget
+   - Reponses naturelles : pas de listes generiques repetitives
 """
 import os
 import json
@@ -85,8 +87,8 @@ def log(prefixe, message):
 # OUTILS POUR L'IA
 # ====================================================================
 def chercher_produits(requete="", budget_max=0, categorie=""):
-    """Cherche des produits. Ne plante jamais.
-       Retourne toujours une liste avec message explicite si vide."""
+    """Cherche des produits. Filtre par categorie, mots-cles et budget.
+       Retourne les vrais produits ou un message honnete."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -99,48 +101,86 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
         return [{"erreur": "Base momentanement indisponible"}]
 
     try:
-        resultats = []
-        tokens = normaliser(requete).split()
+        tokens = [t for t in normaliser(requete).split() if len(t) >= 3]
         try:
             budget_max = float(budget_max) if budget_max else 0
         except Exception:
             budget_max = 0
 
+        # Etape 1 : filtrer par categorie si demandee
+        candidats = []
         for p in tous:
-            try:
+            cat_produit = (p.get("categorie") or "").lower()
+            cat_demande = (categorie or "").lower().strip()
+            if cat_demande:
+                # Mapping souple : "pc portable" matche "PC portable"
+                if cat_demande not in cat_produit and cat_produit not in cat_demande:
+                    continue
+            candidats.append(p)
+
+        # Etape 2 : filtrer par mots-cles si fournis
+        if tokens:
+            filtres = []
+            for p in candidats:
                 hay = normaliser((p.get("nom") or "") + " " + (p.get("categorie") or ""))
                 score = sum(len(t) for t in tokens if t in hay)
-                if categorie and categorie.lower() not in (p.get("categorie") or "").lower():
-                    continue
-                if budget_max and (p.get("prix_vente") or 0) > budget_max:
-                    continue
-                if not tokens or score > 0:
-                    resultats.append({
-                        "sku": p.get("sku"),
-                        "nom": p.get("nom"),
-                        "categorie": p.get("categorie"),
-                        "prix": p.get("prix_vente"),
-                        "score": score
-                    })
-            except Exception:
-                continue
+                if score > 0:
+                    filtres.append((score, p))
+            if filtres:
+                filtres.sort(key=lambda x: -x[0])
+                candidats = [p for _, p in filtres]
 
-        resultats.sort(key=lambda x: -x.get("score", 0))
-        top = resultats[:5]
+        # Etape 3 : filtrer par budget
+        if budget_max:
+            candidats = [p for p in candidats if (p.get("prix_vente") or 0) <= budget_max]
 
-        # Cas vide : renvoyer un message CLAIR et NON EQUIVOQUE a l'IA
-        if not top:
-            prix_min = min((p.get("prix_vente") or 0) for p in tous) if tous else 0
+        # Etape 4 : trier par prix croissant
+        candidats.sort(key=lambda p: p.get("prix_vente") or 0)
+
+        # Si on a des resultats
+        if candidats:
+            return [{
+                "sku": p.get("sku"),
+                "nom": p.get("nom"),
+                "categorie": p.get("categorie"),
+                "prix": p.get("prix_vente")
+            } for p in candidats[:5]]
+
+        # Aucun resultat : message honnete avec le VRAI prix minimum
+        if categorie:
+            prix_cat = [(p.get("prix_vente") or 0) for p in tous
+                        if categorie.lower() in (p.get("categorie") or "").lower()]
+            prix_min = min(prix_cat) if prix_cat else 0
             return [{
                 "aucun_resultat": True,
-                "message": "AUCUN PRODUIT du catalogue ne correspond a cette recherche.",
+                "message": "Aucun produit de la categorie '{}' ne correspond a ce budget.".format(categorie),
                 "budget_demande": budget_max,
                 "categorie_demandee": categorie,
-                "prix_minimum_catalogue": prix_min,
-                "instruction": "Dis honnetement au client qu'aucun produit ne correspond. Propose UNIQUEMENT d'elargir le budget ou de voir une autre categorie REELLE du catalogue (Ecran, Composant, Accessoire). N'invente AUCUN produit."
+                "prix_minimum_cette_categorie": prix_min,
+                "instruction": "Dis honnetement qu'aucun produit ne correspond. Cite le prix minimum REEL de la categorie demandee. N'invente AUCUN produit, AUCUNE marque, AUCUN modele. Ne mentionne que les categories reelles du catalogue."
             }]
 
-        return top
+        # Aucune categorie : donner les vraies categories du catalogue
+        categories_reelles = {}
+        for p in tous:
+            cat = p.get("categorie") or "Autre"
+            if cat not in categories_reelles:
+                categories_reelles[cat] = (p.get("prix_vente") or 0)
+            else:
+                categories_reelles[cat] = min(
+                    categories_reelles[cat], p.get("prix_vente") or 0
+                )
+
+        return [{
+            "aucun_resultat": True,
+            "message": "Aucun produit ne correspond a cette recherche.",
+            "budget_demande": budget_max,
+            "categories_disponibles": [
+                {"nom": cat, "prix_min": prix}
+                for cat, prix in sorted(categories_reelles.items(), key=lambda x: x[1])
+            ],
+            "instruction": "Dis honnetement qu'aucun produit ne correspond. Cite UNIQUEMENT les categories REELLES du catalogue avec leur prix minimum REEL. N'invente RIEN."
+        }]
     except Exception as e:
         log("ERR", "chercher_produits traitement: " + str(e))
         return [{"erreur": "Erreur lors de la recherche"}]
@@ -199,13 +239,13 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "chercher_produits",
-            "description": "Cherche des produits dans le catalogue WeloobeAI. Retourne UNIQUEMENT les produits existants. Si aucun ne correspond, indique-le clairement.",
+            "description": "Cherche des produits dans le catalogue WeloobeAI. Filtre par categorie, mots-cles et budget. Retourne uniquement les produits existants.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "requete": {"type": "string", "description": "Mots-cles (ex: 'pc portable', 'ecran')"},
+                    "requete": {"type": "string", "description": "Mots-cles de recherche (ex: 'latitude', 'elitebook', 'ecran 24')"},
                     "budget_max": {"type": "number", "description": "Budget maximum en FCFA (0 si non specifie)"},
-                    "categorie": {"type": "string", "description": "Categorie EXACTE parmi : PC portable, PC fixe, Ecran, Composant, Accessoire"}
+                    "categorie": {"type": "string", "description": "Categorie exacte : PC portable, PC fixe, Ecran, Composant ou Accessoire"}
                 }
             }
         }
@@ -249,7 +289,8 @@ def charger_historique(psid, limite=10):
         cur.close()
         conn.close()
         rows = list(reversed(rows))
-        return [{"role": r.get("role") or "user", "content": r.get("contenu") or ""} for r in rows]
+        return [{"role": r.get("role") or "user", "content": r.get("contenu") or ""}
+                for r in rows]
     except Exception as e:
         log("WARN", "charger_historique: " + str(e))
         return []
@@ -271,45 +312,46 @@ def enregistrer_message(psid, role, contenu):
 
 
 # ====================================================================
-# SYSTEM PROMPT — ANTI-HALLUCINATION
+# SYSTEM PROMPT — ANTI-HALLUCINATION ET NATUREL
 # ====================================================================
-SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde (Cameroun).
+SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde, Cameroun.
 
-=== REGLE ABSOLUE ET NON NEGOCIABLE ===
-Tu ne dois JAMAIS inventer, suggerer, ou mentionner un produit, un modele, une marque, une categorie ou un prix qui ne vient PAS d'un appel d'outil.
+=== REGLES ABSOLUES ET NON NEGOCIABLES ===
+1. Tu ne proposes QUE les produits retournes par les outils. Tu n'inventes JAMAIS un produit, une marque, un modele ou un prix.
+2. INTERDICTION FORMELLE de mentionner : Chromebook, tablette, iPad, reconditionne, occasion, partenaire externe, pack etudiant, carte graphique, sac, casque, support ecran, ou tout produit absent du catalogue.
+3. Tu ne mentionnes QUE les categories qui existent reellement : PC portable, PC fixe, Ecran, Composant, Accessoire.
+4. Tu ne proposes JAMAIS de produits d'occasion ou reconditionnes.
 
-INTERDICTIONS STRICTES :
-- Ne JAMAIS mentionner : Chromebook, tablette, iPad, reconditionne, occasion, pack etudiant, partenaire externe, produits d'autres marques non listes.
-- Ne JAMAIS inventer de prix.
-- Ne JAMAIS proposer un produit si l'outil chercher_produits a retourne "aucun_resultat".
+=== COMPORTEMENT NATUREL ===
 
-SI L'OUTIL RETOURNE "aucun_resultat" :
-Tu dois dire HONNETEMENT au client :
-1. Qu'aucun produit du catalogue ne correspond a sa recherche
-2. Le prix du produit le moins cher du catalogue (fourni dans le champ "prix_minimum_catalogue")
-3. Proposer UNIQUEMENT ces options REELLES :
-   - Elargir le budget
-   - Voir une autre categorie REELLE du catalogue : Ecran, Composant, Accessoire
-   - Laisser ses coordonnees pour etre rappele
+Quand un client cherche un produit SANS budget :
+- Utilise chercher_produits avec la categorie appropriee (sans budget_max)
+- Presente 2-3 modeles avec LEUR PRIX REEL
+- Ne demande pas de budget d'abord : montre ce que tu as
 
-=== TON ROLE ===
-- Accueillir chaleureusement les clients
-- Comprendre leur besoin
-- Proposer UNIQUEMENT les produits retournes par chercher_produits
-- Donner les prix EXACTEMENT tels qu'ils viennent de la base
-- Verifier la disponibilite avec verifier_stock
+Quand un client donne un budget TROP BAS :
+- Cite le prix REEL du produit le moins cher dans cette categorie
+- Propose UNE alternative pertinente, pas 3 options generiques
+- Exemple : "Nos PC portables demarrent a 465 000 FCFA. Preferez-vous voir nos ecrans a partir de 120 000 FCFA, ou ceux qui rentrent dans 500 000 ?"
+
+Quand un client decrit un USAGE precis (etudiante, bureautique, jeux) :
+- Cherche les produits adaptes dans le catalogue
+- Explique POURQUOI ce modele convient (portabilite, autonomie, ecran)
+- Ne pose pas 3 questions d'un coup
+
+Quand un client dit juste "bonjour" :
+- Reponse courte et chaleureuse (1-2 phrases)
+- Demande ce qu'il cherche
 
 === STYLE ===
-- Naturel, amical, professionnel
-- Emojis avec moderation
+- Naturel, direct, chaleureux
+- Une ou deux phrases par idee, pas de listes a rallonge
+- Ne repete PAS "je suis la pour vous aider" ou "je suis a votre disposition"
+- Un seul emoji maximum par reponse
 - Reponds toujours en francais
 
-=== CATEGORIES REELLES DU CATALOGUE ===
-- PC portable
-- PC fixe
-- Ecran
-- Composant
-- Accessoire"""
+=== CATEGORIES REELLES ===
+PC portable, PC fixe, Ecran, Composant, Accessoire."""
 
 
 def appeler_ia(messages, avec_outils=True):
@@ -359,7 +401,6 @@ def executer_outil(nom, args):
 
 def repondre_avec_ia(psid, message_client):
     """Genere une reponse. Ne plante jamais."""
-
     if not client_ia:
         return "Bonjour ! Je suis l'assistant WeloobeAI. Le service est en cours de configuration, merci de reessayer dans quelques instants."
 
@@ -430,7 +471,7 @@ def repondre_avec_ia(psid, message_client):
 
             return "J'ai trouve des produits mais je n'arrive pas a formuler la reponse. Reformulez svp."
 
-        # Reponse directe
+        # Reponse directe (pas d'outil appele)
         return msg.content or "Je n'ai pas bien compris."
 
     except Exception as e:
@@ -608,8 +649,10 @@ def init_database():
                             "INSERT INTO produits (sku, nom, categorie, prix_achat, prix_vente, stock_initial, seuil) "
                             "VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (sku) DO NOTHING",
                             (str(sku), str(nom), ws.cell(r, 11).value or "",
-                             int(ws.cell(r, 3).value or 0), int(ws.cell(r, 4).value or 0),
-                             int(ws.cell(r, 5).value or 0), int(ws.cell(r, 10).value or 2))
+                             int(ws.cell(r, 3).value or 0),
+                             int(ws.cell(r, 4).value or 0),
+                             int(ws.cell(r, 5).value or 0),
+                             int(ws.cell(r, 10).value or 2))
                         )
                         importes += 1
                     except Exception:
