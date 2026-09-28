@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Bot Messenger WeloobeAI v2.1
-   - Memoire conversationnelle longue + profil client
-   - Post-traitement des reponses
+"""Bot Messenger WeloobeAI v3
+   - Gestion d'etat explicite : recherche / commande / contexte
+   - Memoire du dernier produit propose
    - Machine a etats pour la commande
-   - Fallback robuste si le second appel IA echoue
+   - Fallback robuste si l'IA echoue
 """
 import os
 import re
@@ -91,11 +91,7 @@ def log(prefixe, message):
         pass
 
 
-# ====================================================================
-# POST-TRAITEMENT DES REPONSES
-# ====================================================================
 def formater_reponse(texte):
-    """Nettoie le texte pour un affichage Messenger optimal."""
     if not texte:
         return ""
     try:
@@ -106,21 +102,9 @@ def formater_reponse(texte):
         texte = re.sub(r"`(.+?)`", r"\1", texte)
         texte = re.sub(r"^#+\s*", "", texte, flags=re.MULTILINE)
         texte = re.sub(r"^\s*[-*]\s+", "• ", texte, flags=re.MULTILINE)
-
-        lignes = []
-        for ligne in texte.split("\n"):
-            if ligne.strip().startswith("|") and ligne.strip().endswith("|"):
-                if set(ligne.replace("|", "").replace("-", "").replace(":", "").strip()) == set():
-                    continue
-                cells = [c.strip() for c in ligne.strip("|").split("|")]
-                ligne = " • ".join(c for c in cells if c)
-            lignes.append(ligne)
-        texte = "\n".join(lignes)
-
         texte = re.sub(r"\n{3,}", "\n\n", texte)
         texte = re.sub(r"[ \t]+", " ", texte)
         texte = texte.strip()
-
         if len(texte) > 1800:
             texte = texte[:1797] + "..."
         return texte
@@ -143,10 +127,10 @@ def charger_profil(psid):
         if not row:
             return {
                 "psid": psid, "nom": None, "telephone": None,
-                "budget": None, "commande_en_cours": None
+                "commande_en_cours": None, "derniers_produits": None
             }
         profil = dict(row)
-        for champ in ["commande_en_cours"]:
+        for champ in ["commande_en_cours", "derniers_produits"]:
             if profil.get(champ):
                 try:
                     profil[champ] = json.loads(profil[champ])
@@ -168,24 +152,21 @@ def maj_profil(psid, **kwargs):
                 "INSERT INTO clients (psid, derniere_interaction) VALUES (%s, %s)",
                 (psid, datetime.datetime.now().isoformat())
             )
-
         champs = []
         valeurs = []
         for cle, val in kwargs.items():
-            if val is not None or val is None:  # on accepte None pour effacer
-                champs.append("{} = %s".format(cle))
-                if isinstance(val, (list, dict)):
-                    valeurs.append(json.dumps(val))
-                else:
-                    valeurs.append(val)
-
+            champs.append("{} = %s".format(cle))
+            if isinstance(val, (list, dict)):
+                valeurs.append(json.dumps(val))
+            else:
+                valeurs.append(val)
         if champs:
             valeurs.extend([datetime.datetime.now().isoformat(), psid])
-            requete = "UPDATE clients SET {}, derniere_interaction = %s WHERE psid = %s".format(
-                ", ".join(champs)
+            cur.execute(
+                "UPDATE clients SET {}, derniere_interaction = %s WHERE psid = %s".format(
+                    ", ".join(champs)),
+                valeurs
             )
-            cur.execute(requete, valeurs)
-
         conn.commit()
         cur.close()
         conn.close()
@@ -194,7 +175,61 @@ def maj_profil(psid, **kwargs):
 
 
 # ====================================================================
-# OUTILS POUR L'IA
+# DETECTION D'INTENTION
+# ====================================================================
+def detecter_intention(message):
+    low = normaliser(message)
+
+    if any(m in low for m in ["bonjour", "bonsoir", "salut", "hello", "coucou", "hi"]):
+        return "salutation"
+
+    if any(m in low for m in ["annule", "annuler", "laisse tomber", "oublie", "stop"]):
+        return "annulation"
+
+    if low.strip() in ["oui", "ok", "d'accord", "daccord", "confirme", "confirmation"]:
+        return "confirmation"
+
+    if any(m in low for m in [
+        "commander", "commande", "passe ma", "je veux commander",
+        "je prends", "je vais prendre", "je veux acheter", "acheter",
+        "passe commande", "valide"
+    ]):
+        return "commande"
+
+    tel_clean = re.sub(r"[^\d]", "", low)
+    tel_clean = re.sub(r"^(237|00237)", "", tel_clean)
+    if re.match(r"^6\d{8}$", tel_clean):
+        return "fournir_tel"
+
+    if any(m in low for m in ["celui", "celle", "celui-ci", "celui la"]):
+        return "reference_produit"
+
+    if any(m in low for m in [
+        "cherche", "veux", "besoin", "montre", "affiche", "liste",
+        "catalogue", "stock", "prix", "combien", "dispo", "pc",
+        "ordinateur", "portable", "ecran", "moniteur", "ssd", "ram",
+        "accessoire", "composant", "fixe", "tour"
+    ]):
+        return "recherche"
+
+    return "autre"
+
+
+def identifier_produit_par_nom(message, derniers_produits):
+    if not derniers_produits:
+        return None
+    low = normaliser(message)
+    for p in derniers_produits:
+        nom_norm = normaliser(p.get("nom") or "")
+        mots = [m for m in nom_norm.split() if len(m) >= 3]
+        for mot in mots:
+            if mot in low:
+                return p
+    return None
+
+
+# ====================================================================
+# OUTILS
 # ====================================================================
 def chercher_produits(requete="", budget_max=0, categorie=""):
     try:
@@ -219,9 +254,8 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
         candidats = []
         for p in tous:
             cat_prod_norm = normaliser(p.get("categorie") or "")
-            if cat_norm:
-                if cat_norm not in cat_prod_norm and cat_prod_norm not in cat_norm:
-                    continue
+            if cat_norm and cat_norm not in cat_prod_norm and cat_prod_norm not in cat_norm:
+                continue
             candidats.append(p)
 
         if tokens:
@@ -248,41 +282,11 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
                 "prix": p.get("prix_vente")
             } for p in candidats[:3]]
 
-        if cat_norm:
-            prix_cat = []
-            for p in tous:
-                cat_p_norm = normaliser(p.get("categorie") or "")
-                if cat_norm in cat_p_norm or cat_p_norm in cat_norm:
-                    prix = p.get("prix_vente") or 0
-                    if prix > 0:
-                        prix_cat.append(prix)
-            prix_min = min(prix_cat) if prix_cat else 0
-            return [{
-                "aucun_resultat": True,
-                "categorie_demandee": categorie,
-                "budget_demande": budget_max,
-                "prix_minimum_cette_categorie": prix_min,
-                "instruction": "Aucun produit de cette categorie ne rentre dans le budget. Cite le prix REEL minimum et propose UNE alternative REELLE."
-            }]
-
-        categories_reelles = {}
-        for p in tous:
-            cat = p.get("categorie") or "Autre"
-            prix = p.get("prix_vente") or 0
-            if prix > 0:
-                if cat not in categories_reelles:
-                    categories_reelles[cat] = prix
-                else:
-                    categories_reelles[cat] = min(categories_reelles[cat], prix)
-
         return [{
             "aucun_resultat": True,
+            "categorie_demandee": categorie,
             "budget_demande": budget_max,
-            "categories_disponibles": [
-                {"nom": cat, "prix_min": prix}
-                for cat, prix in sorted(categories_reelles.items(), key=lambda x: x[1])
-            ],
-            "instruction": "Aucun produit ne correspond. Cite UNIQUEMENT les categories REELLES avec prix minimum REEL."
+            "message": "Aucun produit ne correspond."
         }]
     except Exception as e:
         log("ERR", "chercher_produits traitement: " + str(e))
@@ -302,13 +306,8 @@ def verifier_stock(sku):
         if not p:
             return {"erreur": "Produit inconnu"}
         stock = (p.get("stock_initial") or 0) - (vendu.get("q") or 0)
-        return {
-            "sku": sku,
-            "nom": p.get("nom"),
-            "stock": stock,
-            "prix": p.get("prix_vente"),
-            "disponible": stock > 0
-        }
+        return {"sku": sku, "nom": p.get("nom"), "stock": stock,
+                "prix": p.get("prix_vente"), "disponible": stock > 0}
     except Exception as e:
         log("ERR", "verifier_stock: " + str(e))
         return {"erreur": "Impossible de verifier le stock"}
@@ -322,21 +321,15 @@ def lister_catalogue():
         produits = cur.fetchall()
         cur.close()
         conn.close()
-        if not produits:
-            return [{"info": "Catalogue vide"}]
-        return [{
-            "sku": p.get("sku"),
-            "nom": p.get("nom"),
-            "categorie": p.get("categorie"),
-            "prix": p.get("prix_vente")
-        } for p in produits]
+        return [{"sku": p.get("sku"), "nom": p.get("nom"),
+                 "categorie": p.get("categorie"), "prix": p.get("prix_vente")}
+                for p in produits]
     except Exception as e:
         log("ERR", "lister_catalogue: " + str(e))
-        return [{"erreur": "Catalogue indisponible"}]
+        return []
 
 
 def demarrer_commande(psid, sku, quantite=1):
-    """Demarre une commande (brouillon)."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -352,19 +345,16 @@ def demarrer_commande(psid, sku, quantite=1):
             "nom_produit": p.get("nom"),
             "prix_unitaire": p.get("prix_vente"),
             "quantite": quantite,
-            "etape": "nom",
-            "nom_client": None,
-            "telephone": None
+            "etape": "nom"
         }
         maj_profil(psid, commande_en_cours=commande)
         return {"succes": True, "commande": commande}
     except Exception as e:
         log("ERR", "demarrer_commande: " + str(e))
-        return {"erreur": "Impossible de demarrer la commande"}
+        return {"erreur": "Impossible de demarrer"}
 
 
 def valider_telephone(tel):
-    """Valide un numero camerounais : 6XXXXXXXX (9 chiffres)"""
     if not tel:
         return False
     tel_clean = re.sub(r"[^\d]", "", str(tel))
@@ -373,19 +363,15 @@ def valider_telephone(tel):
 
 
 def finaliser_commande(psid, nom_client, telephone, notes=""):
-    """Enregistre la commande finale."""
     try:
         profil = charger_profil(psid)
         commande = profil.get("commande_en_cours")
         if not commande:
             return {"erreur": "Aucune commande en cours"}
 
-        # Valider le telephone
         if not valider_telephone(telephone):
-            return {
-                "erreur": "telephone_invalide",
-                "message": "Le numero de telephone n'est pas valide. Format attendu : 6XX XXX XXX (9 chiffres commencant par 6)."
-            }
+            return {"erreur": "telephone_invalide",
+                    "message": "Le numero n'est pas valide. Format attendu : 6XX XXX XXX (9 chiffres commencant par 6)."}
 
         sku = commande.get("sku")
         quantite = int(commande.get("quantite") or 1)
@@ -409,22 +395,16 @@ def finaliser_commande(psid, nom_client, telephone, notes=""):
         conn.close()
 
         maj_profil(psid, commande_en_cours=None, nom=nom_client, telephone=telephone)
+        envoyer_notification_commande(commande_id, nom_client, telephone,
+                                       commande.get("nom_produit"), quantite,
+                                       prix_total, notes)
 
-        envoyer_notification_commande(
-            commande_id, nom_client, telephone, commande.get("nom_produit"),
-            quantite, prix_total, notes
-        )
-
-        return {
-            "succes": True,
-            "commande_id": commande_id,
-            "produit": commande.get("nom_produit"),
-            "quantite": quantite,
-            "prix_total": prix_total
-        }
+        return {"succes": True, "commande_id": commande_id,
+                "produit": commande.get("nom_produit"),
+                "quantite": quantite, "prix_total": prix_total}
     except Exception as e:
         log("ERR", "finaliser_commande: " + str(e))
-        return {"erreur": "Impossible d'enregistrer la commande"}
+        return {"erreur": "Impossible d'enregistrer"}
 
 
 def envoyer_notification_commande(commande_id, nom, telephone, produit,
@@ -439,18 +419,14 @@ def envoyer_notification_commande(commande_id, nom, telephone, produit,
         corps = """Nouvelle commande recue via Messenger.
 
 Commande #{cid}
--------------------------------------
 Client      : {nom}
 Telephone   : {tel}
 Produit     : {prod}
 Quantite    : {qte}
 Prix total  : {prix}
-Notes       : {notes}
--------------------------------------""".format(
-            cid=commande_id, nom=nom, tel=telephone,
-            prod=produit, qte=quantite, prix=prix_total,
-            notes=notes or "aucune"
-        )
+Notes       : {notes}""".format(
+            cid=commande_id, nom=nom, tel=telephone, prod=produit,
+            qte=quantite, prix=prix_total, notes=notes or "aucune")
         msg.attach(MIMEText(corps, "plain", "utf-8"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
             server.login(SMTP_USER, SMTP_PASSWORD)
@@ -463,87 +439,37 @@ Notes       : {notes}
 
 
 OUTILS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "chercher_produits",
-            "description": "Cherche des produits dans le catalogue",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "requete": {"type": "string"},
-                    "budget_max": {"type": "number"},
-                    "categorie": {"type": "string"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "verifier_stock",
-            "description": "Verifie la disponibilite d'un produit par SKU",
-            "parameters": {
-                "type": "object",
-                "properties": {"sku": {"type": "string"}},
-                "required": ["sku"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "lister_catalogue",
-            "description": "Liste tous les produits du catalogue",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "demarrer_commande",
-            "description": "Demarre une commande. Utilise UNIQUEMENT quand le client a confirme le produit et la quantite.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "sku": {"type": "string"},
-                    "quantite": {"type": "integer"}
-                },
-                "required": ["sku"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "finaliser_commande",
-            "description": "Finalise la commande avec le nom et le telephone du client.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "nom_client": {"type": "string"},
-                    "telephone": {"type": "string"},
-                    "notes": {"type": "string"}
-                },
-                "required": ["nom_client", "telephone"]
-            }
-        }
-    }
+    {"type": "function", "function": {
+        "name": "chercher_produits",
+        "description": "Cherche des produits dans le catalogue",
+        "parameters": {"type": "object", "properties": {
+            "requete": {"type": "string"},
+            "budget_max": {"type": "number"},
+            "categorie": {"type": "string"}
+        }}}},
+    {"type": "function", "function": {
+        "name": "verifier_stock",
+        "description": "Verifie la disponibilite d'un produit",
+        "parameters": {"type": "object", "properties": {"sku": {"type": "string"}},
+                       "required": ["sku"]}}},
+    {"type": "function", "function": {
+        "name": "lister_catalogue",
+        "description": "Liste tout le catalogue",
+        "parameters": {"type": "object", "properties": {}}}},
 ]
 
 
 # ====================================================================
 # HISTORIQUE
 # ====================================================================
-def charger_historique(psid, limite=30):
+def charger_historique(psid, limite=20):
     try:
         conn = db()
         cur = conn.cursor()
         cur.execute(
             "SELECT role, contenu FROM messages WHERE psid = %s "
             "ORDER BY timestamp DESC LIMIT %s",
-            (psid, limite)
-        )
+            (psid, limite))
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -561,8 +487,7 @@ def enregistrer_message(psid, role, contenu):
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO messages (psid, role, contenu, timestamp) VALUES (%s, %s, %s, %s)",
-            (psid, role, contenu or "", datetime.datetime.now().isoformat())
-        )
+            (psid, role, contenu or "", datetime.datetime.now().isoformat()))
         conn.commit()
         cur.close()
         conn.close()
@@ -573,87 +498,24 @@ def enregistrer_message(psid, role, contenu):
 # ====================================================================
 # SYSTEM PROMPT
 # ====================================================================
-SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde, Cameroun.
+SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde.
 
-=== REGLES ABSOLUES ===
+REGLES :
 1. Tu ne proposes QUE les produits retournes par les outils.
-2. INTERDICTION de mentionner : Chromebook, tablette, iPad, reconditionne, occasion, partenaire externe, pack etudiant, carte graphique, sac, casque, cable HDMI.
+2. INTERDICTION de mentionner : Chromebook, tablette, iPad, reconditionne, occasion.
 3. Categories reelles : PC portable, PC fixe, Ecran, Composant, Accessoire.
 4. N'invente JAMAIS de prix.
 
-=== FORMAT DES REPONSES ===
-- Pas d'asterisques, pas de **, pas de #, pas de tableaux Markdown
-- Utilise des puces simples avec le caractere •
-- Reponses courtes : 1 a 3 phrases + liste si necessaire
-- Un seul emoji maximum
-- Pas de "je suis la pour vous aider" repetitif
+FORMAT :
+- Pas d'asterisques, pas de **, pas de #
+- Puces simples avec le caractere •
+- Reponses courtes (1-3 phrases + liste si necessaire)
+- Un emoji maximum
 
-=== COMPORTEMENT ===
-
-Client qui cherche un produit :
-- Utilise chercher_produits
-- Presente 2-3 produits max avec LEUR PRIX REEL
-- Format : "• [nom] - [prix]"
-
-Client qui demande un produit absent :
-- Dis simplement "Nous n'avons pas ce produit en catalogue."
-- Ne propose PAS d'autres categories differentes
-
-Client qui veut commander :
-Etape 1 : Confirme le produit et la quantite
-Etape 2 : Appelle demarrer_commande(sku, quantite)
-Etape 3 : Demande le nom complet
-Etape 4 : Demande le telephone
-Etape 5 : Appelle finaliser_commande(nom_client, telephone)
-Etape 6 : Confirme : "Commande enregistree. Un conseiller vous rappellera."
-
-IMPORTANT :
-- UNE SEULE question a la fois
-- Ne demande pas nom + telephone dans le meme message
-- Si telephone invalide, redemande poliment
-
-=== STYLE ===
-- Naturel, direct, chaleureux
-- Une question a la fois
-- Reponds en francais"""
-
-
-# ====================================================================
-# NETTOYAGE POUR SECOND APPEL
-# ====================================================================
-def nettoyer_pour_final(messages):
-    """Prepare les messages pour le second appel IA (sans outils)."""
-    resultat = []
-    for m in messages:
-        role = m.get("role")
-        if role == "assistant" and m.get("tool_calls"):
-            texte = m.get("content") or ""
-            if texte:
-                resultat.append({"role": "assistant", "content": texte})
-        elif role == "tool":
-            contenu = m.get("content", "")
-            try:
-                data = json.loads(contenu) if isinstance(contenu, str) else contenu
-                if isinstance(data, list):
-                    lignes = []
-                    for item in data[:5]:
-                        if isinstance(item, dict):
-                            if item.get("nom"):
-                                lignes.append("- {} : {}".format(
-                                    item.get("nom"), f(item.get("prix", 0))))
-                            elif item.get("message"):
-                                lignes.append(item["message"])
-                    if lignes:
-                        contenu = "\n".join(lignes)
-            except Exception:
-                pass
-            resultat.append({
-                "role": "system",
-                "content": "Resultat de l'outil :\n" + str(contenu)[:800]
-            })
-        else:
-            resultat.append(m)
-    return resultat
+COMPORTEMENT :
+- Client cherche un produit : utilise chercher_produits, presente 2-3 produits avec leur prix REEL
+- Client dit "je veux commander" : NE RELANCE PAS la recherche de produits
+- Reponds toujours en francais"""
 
 
 # ====================================================================
@@ -662,128 +524,24 @@ def nettoyer_pour_final(messages):
 def appeler_ia(messages, avec_outils=True, force_outil=False):
     if not client_ia:
         return None
-    if not avec_outils:
-        messages = nettoyer_pour_final(messages)
     for modele in MODELES_GROQ:
         try:
             kwargs = {
-                "model": modele,
-                "messages": messages,
-                "temperature": 0.4,
-                "max_tokens": 600
+                "model": modele, "messages": messages,
+                "temperature": 0.4, "max_tokens": 500
             }
             if avec_outils:
                 kwargs["tools"] = OUTILS
                 kwargs["tool_choice"] = "required" if force_outil else "auto"
-            response = client_ia.chat.completions.create(**kwargs)
-            log("IA", "Modele : " + modele + (" [force]" if force_outil else ""))
-            return response
+            return client_ia.chat.completions.create(**kwargs)
         except Exception as e:
             log("WARN", "Modele {} echoue : {}".format(modele, str(e)[:200]))
             continue
     return None
 
 
-def executer_outil(nom, args, psid):
-    try:
-        if nom == "chercher_produits":
-            return chercher_produits(
-                args.get("requete", ""),
-                args.get("budget_max", 0),
-                args.get("categorie", "")
-            )
-        elif nom == "verifier_stock":
-            return verifier_stock(args.get("sku", ""))
-        elif nom == "lister_catalogue":
-            return lister_catalogue()
-        elif nom == "demarrer_commande":
-            return demarrer_commande(
-                psid,
-                args.get("sku", ""),
-                int(args.get("quantite", 1))
-            )
-        elif nom == "finaliser_commande":
-            return finaliser_commande(
-                psid,
-                args.get("nom_client", ""),
-                args.get("telephone", ""),
-                args.get("notes", "")
-            )
-        return {"erreur": "outil inconnu"}
-    except Exception as e:
-        log("ERR", "executer_outil: " + str(e))
-        return {"erreur": "Erreur execution outil"}
-
-
 # ====================================================================
-# FALLBACK : construction manuelle de la reponse
-# ====================================================================
-def construire_reponse_fallback(messages):
-    """Construit une reponse lisible quand le second appel IA echoue."""
-    try:
-        for m in reversed(messages):
-            if m.get("role") == "tool":
-                contenu = m.get("content", "")
-                try:
-                    data = json.loads(contenu) if isinstance(contenu, str) else contenu
-                except Exception:
-                    continue
-
-                if isinstance(data, list) and data:
-                    premier = data[0]
-
-                    # Cas aucun resultat
-                    if premier.get("aucun_resultat"):
-                        msg = premier.get("message", "Aucun produit ne correspond.")
-                        if premier.get("prix_minimum_cette_categorie"):
-                            msg += "\n\nNotre produit le moins cher dans cette categorie est a {}.".format(
-                                f(premier["prix_minimum_cette_categorie"]))
-                        if premier.get("categories_disponibles"):
-                            msg += "\n\nCategories disponibles :"
-                            for c in premier["categories_disponibles"]:
-                                msg += "\n• {} - a partir de {}".format(
-                                    c["nom"], f(c["prix_min"]))
-                        return msg
-
-                    # Cas enregistrer_commande
-                    if premier.get("succes") and premier.get("commande_id"):
-                        d = premier
-                        return ("Commande #{} enregistree !\n\n"
-                                "Produit : {}\nQuantite : {}\nTotal : {}\n\n"
-                                "Un conseiller vous rappellera dans les plus brefs delais.").format(
-                            d["commande_id"], d.get("produit"),
-                            d.get("quantite"), f(d.get("prix_total", 0)))
-
-                    # Cas demarrer_commande
-                    if premier.get("commande"):
-                        cmd = premier["commande"]
-                        return "Tres bon choix ! {} a {}. Pour finaliser, quel est votre nom complet ?".format(
-                            cmd.get("nom_produit"), f(cmd.get("prix_unitaire", 0)))
-
-                    # Cas telephone invalide
-                    if premier.get("erreur") == "telephone_invalide":
-                        return premier.get("message", "Le telephone est invalide. Format : 6XX XXX XXX.")
-
-                    # Cas produits trouves
-                    produits_valides = [p for p in data if p.get("nom")]
-                    if produits_valides:
-                        rep = "Voici ce que je vous propose :\n\n"
-                        for p in produits_valides[:3]:
-                            rep += "• {} - {}\n".format(p["nom"], f(p["prix"]))
-                        rep += "\nLequel vous interesse ?"
-                        return rep
-
-            if m.get("role") == "assistant" and m.get("content"):
-                return m["content"]
-
-        return "Je n'ai pas bien compris. Pouvez-vous reformuler ?"
-    except Exception as e:
-        log("ERR", "construire_reponse_fallback: " + str(e))
-        return "Pouvez-vous reformuler votre demande ?"
-
-
-# ====================================================================
-# REPONSE IA
+# LOGIQUE PRINCIPALE
 # ====================================================================
 def repondre_avec_ia(psid, message_client):
     if not client_ia:
@@ -791,39 +549,104 @@ def repondre_avec_ia(psid, message_client):
 
     try:
         profil = charger_profil(psid)
+        intention = detecter_intention(message_client)
+        derniers_produits = profil.get("derniers_produits") or []
+        commande = profil.get("commande_en_cours")
 
-        contexte_client = ""
-        if profil.get("nom"):
-            contexte_client += "\nNom du client (deja connu) : {}".format(profil["nom"])
-        if profil.get("telephone"):
-            contexte_client += "\nTelephone (deja connu) : {}".format(profil["telephone"])
-        if profil.get("commande_en_cours"):
-            cmd = profil["commande_en_cours"]
-            contexte_client += "\nCommande en cours : {} x {} (etape: {})".format(
-                cmd.get("quantite", 1), cmd.get("nom_produit"), cmd.get("etape"))
+        log("INTENTION", "{} -> {}".format(message_client[:40], intention))
 
-        system_complet = SYSTEM_PROMPT
-        if contexte_client:
-            system_complet += "\n\n=== CONTEXTE CLIENT ===\n" + contexte_client
-            system_complet += "\n\nUtilise ces infos : ne redemande PAS ce que le client a deja donne."
+        # ============================================================
+        # CAS 1 : COMMANDE EN COURS
+        # ============================================================
+        if commande:
+            etape = commande.get("etape")
 
-        historique = charger_historique(psid, limite=30)
+            if intention == "annulation":
+                maj_profil(psid, commande_en_cours=None)
+                return "Pas de probleme, j'ai annule la commande."
 
-        messages = [{"role": "system", "content": system_complet}]
-        messages.extend(historique)
-        messages.append({"role": "user", "content": message_client})
+            if etape == "nom":
+                if intention == "fournir_tel":
+                    return "J'ai d'abord besoin de votre nom complet. Quel est-il ?"
+                if intention == "commande":
+                    return "Votre commande est deja en cours. Quel est votre nom complet ?"
+                nom = message_client.strip()
+                if len(nom) < 2:
+                    return "Pouvez-vous me donner votre nom complet ?"
+                commande["etape"] = "telephone"
+                commande["nom_client"] = nom
+                maj_profil(psid, commande_en_cours=commande, nom=nom)
+                return "Merci {} ! Quel est votre numero de telephone (format : 6XX XXX XXX) ?".format(nom)
 
-        low = normaliser(message_client)
-        mots_produits = ["pc", "ordinateur", "portable", "ecran", "moniteur", "ssd", "ram",
-                         "batterie", "chargeur", "accessoire", "composant", "fixe", "tour",
-                         "montre", "affiche", "liste", "catalogue", "stock", "prix", "cherche",
-                         "veux", "besoin", "dispo", "combien", "commande", "acheter",
-                         "commander", "prends", "prend", "oui", "ok"]
-        forcer = any(m in low for m in mots_produits)
+            if etape == "telephone":
+                if intention == "commande":
+                    return "Quel est votre numero de telephone ?"
 
+                tel_clean = re.sub(r"[^\d]", "", message_client)
+                tel_clean = re.sub(r"^(237|00237)", "", tel_clean)
+
+                if re.match(r"^6\d{8}$", tel_clean):
+                    resultat = finaliser_commande(
+                        psid, commande.get("nom_client"), tel_clean
+                    )
+                    if resultat.get("succes"):
+                        return ("Commande #{} enregistree !\n\n"
+                                "Produit : {}\n"
+                                "Quantite : {}\n"
+                                "Total : {}\n\n"
+                                "Un conseiller vous rappellera au {} dans les plus brefs delais.").format(
+                            resultat["commande_id"], resultat["produit"],
+                            resultat["quantite"], f(resultat["prix_total"]),
+                            tel_clean
+                        )
+                    return "Erreur lors de l'enregistrement. Reformulez svp."
+
+                return "Le numero n'est pas valide. Format attendu : 6XX XXX XXX (9 chiffres commencant par 6)."
+
+        # ============================================================
+        # CAS 2 : INTENTION DE COMMANDE
+        # ============================================================
+        if intention == "commande":
+            produit_cible = identifier_produit_par_nom(message_client, derniers_produits)
+            if not produit_cible and len(derniers_produits) == 1:
+                produit_cible = derniers_produits[0]
+
+            if not produit_cible:
+                if derniers_produits:
+                    liste = "\n".join("• {} - {}".format(p["nom"], f(p["prix"]))
+                                     for p in derniers_produits)
+                    return "Quel produit souhaitez-vous commander ?\n\n" + liste
+                return "Quel produit souhaitez-vous commander ?"
+
+            resultat = demarrer_commande(psid, produit_cible["sku"], 1)
+            if resultat.get("succes"):
+                return "Tres bon choix !\n\n{} a {}.\n\nQuel est votre nom complet ?".format(
+                    produit_cible["nom"], f(produit_cible["prix"]))
+            return "Je n'arrive pas a demarrer la commande. Reformulez svp."
+
+        # ============================================================
+        # CAS 3 : REFERENCE A UN PRODUIT
+        # ============================================================
+        if intention == "reference_produit" and derniers_produits:
+            produit = identifier_produit_par_nom(message_client, derniers_produits)
+            if produit:
+                return "{} a {}.\n\nSouhaitez-vous le commander ?".format(
+                    produit["nom"], f(produit["prix"]))
+
+        # ============================================================
+        # CAS 4 : RECHERCHE DE PRODUITS
+        # ============================================================
+        historique = charger_historique(psid, limite=10)
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            *historique,
+            {"role": "user", "content": message_client}
+        ]
+
+        forcer = intention == "recherche"
         response = appeler_ia(messages, avec_outils=True, force_outil=forcer)
         if not response:
-            return "Je rencontre un souci technique. Pouvez-vous reformuler ?"
+            return "Je n'ai pas bien compris. Pouvez-vous reformuler ?"
 
         try:
             msg = response.choices[0].message
@@ -835,35 +658,38 @@ def repondre_avec_ia(psid, message_client):
             messages.append({
                 "role": "assistant",
                 "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments
-                        }
-                    } for tc in tool_calls
-                ]
+                "tool_calls": [{
+                    "id": tc.id, "type": "function",
+                    "function": {"name": tc.function.name,
+                                 "arguments": tc.function.arguments}
+                } for tc in tool_calls]
             })
 
-            produit_photo = None
+            produits_trouves = None
 
             for tool_call in tool_calls:
                 try:
                     nom_outil = tool_call.function.name
-                    args_str = tool_call.function.arguments or "{}"
                     try:
-                        args = json.loads(args_str)
+                        args = json.loads(tool_call.function.arguments or "{}")
                     except Exception:
                         args = {}
-
                     log("OUTIL", "{} ({})".format(nom_outil, args))
-                    resultat = executer_outil(nom_outil, args, psid)
 
-                    if nom_outil == "chercher_produits" and isinstance(resultat, list):
-                        if len(resultat) == 1 and resultat[0].get("sku"):
-                            produit_photo = resultat[0]
+                    if nom_outil == "chercher_produits":
+                        resultat = chercher_produits(
+                            args.get("requete", ""),
+                            args.get("budget_max", 0),
+                            args.get("categorie", "")
+                        )
+                        if isinstance(resultat, list) and resultat and not resultat[0].get("aucun_resultat"):
+                            produits_trouves = resultat
+                    elif nom_outil == "verifier_stock":
+                        resultat = verifier_stock(args.get("sku", ""))
+                    elif nom_outil == "lister_catalogue":
+                        resultat = lister_catalogue()
+                    else:
+                        resultat = {"erreur": "outil inconnu"}
 
                     messages.append({
                         "role": "tool",
@@ -871,37 +697,41 @@ def repondre_avec_ia(psid, message_client):
                         "content": json.dumps(resultat, ensure_ascii=False, default=str)
                     })
                 except Exception as e:
-                    log("ERR", "traitement tool_call: " + str(e))
-                    continue
+                    log("ERR", "traitement tool: " + str(e))
 
-            # Second appel IA
-            response2 = appeler_ia(messages, avec_outils=False)
-            reponse = None
-            if response2:
-                try:
-                    reponse = response2.choices[0].message.content
-                except Exception as e:
-                    log("WARN", "Parse response2: " + str(e))
+            if produits_trouves:
+                maj_profil(psid, derniers_produits=produits_trouves)
 
-            # Fallback si echec
-            if not reponse:
-                reponse = construire_reponse_fallback(messages)
+            try:
+                response2 = client_ia.chat.completions.create(
+                    model=MODELES_GROQ[0],
+                    messages=messages,
+                    temperature=0.4,
+                    max_tokens=500
+                )
+                reponse = response2.choices[0].message.content
+            except Exception:
+                if produits_trouves:
+                    reponse = "Voici ce que je vous propose :\n\n"
+                    for p in produits_trouves[:3]:
+                        reponse += "• {} - {}\n".format(p["nom"], f(p["prix"]))
+                    reponse += "\nLequel vous interesse ?"
+                else:
+                    reponse = "Je n'ai pas trouve de produit correspondant."
 
-            reponse = formater_reponse(reponse)
+            return formater_reponse(reponse)
 
-            if produit_photo:
-                envoyer_photo(psid, produit_photo["sku"])
-
-            return reponse
-
-        return formater_reponse(msg.content or "Je n'ai pas bien compris.")
+        return formater_reponse(msg.content or "Pouvez-vous reformuler ?")
 
     except Exception as e:
         log("ERR", "repondre_avec_ia: " + str(e))
         log("ERR", traceback.format_exc()[:500])
-        return "Je rencontre un souci technique."
+        return "Je rencontre un souci technique. Reformulez svp."
 
 
+# ====================================================================
+# MESSENGER
+# ====================================================================
 def envoyer_message(psid, texte):
     if not PAGE_ACCESS_TOKEN:
         return False
@@ -918,61 +748,18 @@ def envoyer_message(psid, texte):
         return False
 
 
-def envoyer_photo(psid, sku):
-    try:
-        dossier = Path("photos")
-        if not dossier.exists():
-            return False
-        fichier = None
-        for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG"]:
-            candidate = dossier / (sku + ext)
-            if candidate.exists():
-                fichier = candidate
-                break
-        if not fichier:
-            return False
-
-        url_image = "{}/photos/{}".format(PUBLIC_URL, fichier.name)
-        url = "https://graph.facebook.com/v20.0/me/messages"
-        params = {"access_token": PAGE_ACCESS_TOKEN}
-        payload = {
-            "recipient": {"id": psid},
-            "message": {
-                "attachment": {
-                    "type": "image",
-                    "payload": {"url": url_image, "is_reusable": True}
-                }
-            }
-        }
-        r = requests.post(url, params=params, json=payload, timeout=10)
-        log("PHOTO", "{} - {}".format(r.status_code, url_image))
-        return r.status_code == 200
-    except Exception as e:
-        log("ERR", "envoyer_photo: " + str(e))
-        return False
-
-
 # ====================================================================
 # ROUTES
 # ====================================================================
 @app.route("/", methods=["GET"])
 def accueil():
     return jsonify({
-        "status": "ok",
-        "version": "v2.1",
+        "status": "ok", "version": "v3",
         "bot": "WeloobeAI Chatbot",
         "ia": "connectee" if client_ia else "non configuree",
         "db": "connectee" if DATABASE_URL else "non configuree",
         "email": "configure" if SMTP_USER else "non configure"
     })
-
-
-@app.route("/photos/<path:filename>")
-def servir_photo(filename):
-    try:
-        return send_from_directory("photos", filename)
-    except Exception:
-        return "Not found", 404
 
 
 @app.route("/webhook", methods=["GET"])
@@ -1003,25 +790,19 @@ def webhook_reception():
                     texte = event.get("message", {}).get("text", "")
                     if not psid or not texte:
                         continue
-
                     log("RECU", "{} : {}".format(psid, texte))
                     enregistrer_message(psid, "user", texte)
-
                     reponse = repondre_avec_ia(psid, texte)
                     if not reponse:
-                        reponse = "Je n'ai pas de reponse pour le moment."
-
+                        reponse = "Pouvez-vous reformuler ?"
                     enregistrer_message(psid, "assistant", reponse)
                     envoyer_message(psid, reponse)
-
                 except Exception as e:
                     log("ERR", "traitement event: " + str(e))
                     continue
-
         return "EVENT_RECEIVED", 200
-
     except Exception as e:
-        log("ERR", "webhook_reception global: " + str(e))
+        log("ERR", "webhook_reception: " + str(e))
         return "EVENT_RECEIVED", 200
 
 
@@ -1035,72 +816,34 @@ def init_database():
         conn = db()
         cur = conn.cursor()
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS produits (
-                sku TEXT PRIMARY KEY,
-                nom TEXT NOT NULL,
-                categorie TEXT,
-                prix_achat INTEGER,
-                prix_vente INTEGER,
-                stock_initial INTEGER,
-                seuil INTEGER
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS produits (
+            sku TEXT PRIMARY KEY, nom TEXT NOT NULL, categorie TEXT,
+            prix_achat INTEGER, prix_vente INTEGER,
+            stock_initial INTEGER, seuil INTEGER)""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS clients (
-                psid TEXT PRIMARY KEY,
-                nom TEXT,
-                telephone TEXT,
-                budget INTEGER,
-                derniers_produits_vus TEXT,
-                commande_en_cours TEXT,
-                derniere_interaction TEXT
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS clients (
+            psid TEXT PRIMARY KEY, nom TEXT, telephone TEXT, budget INTEGER,
+            derniers_produits TEXT, commande_en_cours TEXT,
+            derniere_interaction TEXT)""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                psid TEXT,
-                role TEXT,
-                contenu TEXT,
-                timestamp TEXT
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS messages (
+            id SERIAL PRIMARY KEY, psid TEXT, role TEXT,
+            contenu TEXT, timestamp TEXT)""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS ventes (
-                id SERIAL PRIMARY KEY,
-                date TEXT,
-                sku TEXT,
-                quantite INTEGER,
-                client TEXT
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS ventes (
+            id SERIAL PRIMARY KEY, date TEXT, sku TEXT,
+            quantite INTEGER, client TEXT)""")
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS commandes (
-                id SERIAL PRIMARY KEY,
-                psid TEXT,
-                nom_client TEXT,
-                telephone TEXT,
-                sku TEXT,
-                nom_produit TEXT,
-                quantite INTEGER,
-                prix_unitaire INTEGER,
-                prix_total INTEGER,
-                statut TEXT DEFAULT 'nouvelle',
-                notes TEXT,
-                timestamp TEXT
-            )
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS commandes (
+            id SERIAL PRIMARY KEY, psid TEXT, nom_client TEXT, telephone TEXT,
+            sku TEXT, nom_produit TEXT, quantite INTEGER,
+            prix_unitaire INTEGER, prix_total INTEGER,
+            statut TEXT DEFAULT 'nouvelle', notes TEXT, timestamp TEXT)""")
 
         for alter in [
             "ALTER TABLE clients ADD COLUMN IF NOT EXISTS nom TEXT",
             "ALTER TABLE clients ADD COLUMN IF NOT EXISTS telephone TEXT",
-            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS budget INTEGER",
-            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS derniers_produits_vus TEXT",
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS derniers_produits TEXT",
             "ALTER TABLE clients ADD COLUMN IF NOT EXISTS commande_en_cours TEXT",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS role TEXT",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp TEXT",
@@ -1113,8 +856,7 @@ def init_database():
         conn.commit()
 
         cur.execute("SELECT COUNT(*) AS n FROM produits")
-        row = cur.fetchone()
-        if (row.get("n") or 0) == 0:
+        if (cur.fetchone().get("n") or 0) == 0:
             try:
                 from openpyxl import load_workbook
                 wb = load_workbook("Gestion_stock_corrige.xlsx", data_only=False)
@@ -1133,8 +875,7 @@ def init_database():
                              int(ws.cell(r, 3).value or 0),
                              int(ws.cell(r, 4).value or 0),
                              int(ws.cell(r, 5).value or 0),
-                             int(ws.cell(r, 10).value or 2))
-                        )
+                             int(ws.cell(r, 10).value or 2)))
                         importes += 1
                     except Exception:
                         continue
@@ -1145,7 +886,7 @@ def init_database():
 
         cur.close()
         conn.close()
-        log("DB", "Base v2.1 initialisee")
+        log("DB", "Base v3 initialisee")
     except Exception as e:
         log("ERR", "init_database: " + str(e))
 
@@ -1161,7 +902,7 @@ except Exception as e:
 # ====================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Bot Messenger WeloobeAI v2.1")
+    print("  Bot Messenger WeloobeAI v3")
     print("  IA    : {}".format("connectee" if client_ia else "NON"))
     print("  DB    : {}".format("connectee" if DATABASE_URL else "NON"))
     print("  Email : {}".format("configure" if SMTP_USER else "NON"))
