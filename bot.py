@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Bot Messenger WeloobeAI v2
+"""Bot Messenger WeloobeAI v2.1
    - Memoire conversationnelle longue + profil client
-   - Post-traitement des reponses (formatage Messenger)
-   - Machine a etats pour la prise de commande
+   - Post-traitement des reponses
+   - Machine a etats pour la commande
+   - Fallback robuste si le second appel IA echoue
 """
 import os
 import re
@@ -98,37 +99,30 @@ def formater_reponse(texte):
     if not texte:
         return ""
     try:
-        # Retirer le Markdown qui s'affiche mal sur Messenger
-        texte = re.sub(r"\*\*(.+?)\*\*", r"\1", texte)  # **gras**
-        texte = re.sub(r"\*(.+?)\*", r"\1", texte)       # *italique*
+        texte = re.sub(r"\*\*(.+?)\*\*", r"\1", texte)
+        texte = re.sub(r"\*(.+?)\*", r"\1", texte)
         texte = re.sub(r"__(.+?)__", r"\1", texte)
         texte = re.sub(r"_(.+?)_", r"\1", texte)
         texte = re.sub(r"`(.+?)`", r"\1", texte)
         texte = re.sub(r"^#+\s*", "", texte, flags=re.MULTILINE)
-
-        # Remplacer les puces Markdown par des puces propres
         texte = re.sub(r"^\s*[-*]\s+", "• ", texte, flags=re.MULTILINE)
 
-        # Retirer les tableaux Markdown (| col | col |)
         lignes = []
         for ligne in texte.split("\n"):
             if ligne.strip().startswith("|") and ligne.strip().endswith("|"):
                 if set(ligne.replace("|", "").replace("-", "").replace(":", "").strip()) == set():
-                    continue  # ligne de separation
+                    continue
                 cells = [c.strip() for c in ligne.strip("|").split("|")]
                 ligne = " • ".join(c for c in cells if c)
             lignes.append(ligne)
         texte = "\n".join(lignes)
 
-        # Nettoyer les espaces multiples et lignes vides consecutives
         texte = re.sub(r"\n{3,}", "\n\n", texte)
         texte = re.sub(r"[ \t]+", " ", texte)
         texte = texte.strip()
 
-        # Limiter la longueur
         if len(texte) > 1800:
             texte = texte[:1797] + "..."
-
         return texte
     except Exception as e:
         log("WARN", "formater_reponse: " + str(e))
@@ -139,7 +133,6 @@ def formater_reponse(texte):
 # PROFIL CLIENT
 # ====================================================================
 def charger_profil(psid):
-    """Charge le profil enrichi du client."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -149,23 +142,16 @@ def charger_profil(psid):
         conn.close()
         if not row:
             return {
-                "psid": psid,
-                "nom": None,
-                "telephone": None,
-                "budget": None,
-                "derniers_produits_vus": [],
-                "commande_en_cours": None
+                "psid": psid, "nom": None, "telephone": None,
+                "budget": None, "commande_en_cours": None
             }
         profil = dict(row)
-        # Parse JSON des derniers produits vus
-        for champ in ["derniers_produits_vus", "commande_en_cours"]:
+        for champ in ["commande_en_cours"]:
             if profil.get(champ):
                 try:
                     profil[champ] = json.loads(profil[champ])
                 except Exception:
-                    profil[champ] = [] if champ == "derniers_produits_vus" else None
-            else:
-                profil[champ] = [] if champ == "derniers_produits_vus" else None
+                    profil[champ] = None
         return profil
     except Exception as e:
         log("WARN", "charger_profil: " + str(e))
@@ -173,12 +159,9 @@ def charger_profil(psid):
 
 
 def maj_profil(psid, **kwargs):
-    """Met a jour le profil client."""
     try:
         conn = db()
         cur = conn.cursor()
-
-        # S'assurer que le client existe
         cur.execute("SELECT psid FROM clients WHERE psid = %s", (psid,))
         if not cur.fetchone():
             cur.execute(
@@ -186,11 +169,10 @@ def maj_profil(psid, **kwargs):
                 (psid, datetime.datetime.now().isoformat())
             )
 
-        # Mise a jour des champs
         champs = []
         valeurs = []
         for cle, val in kwargs.items():
-            if val is not None:
+            if val is not None or val is None:  # on accepte None pour effacer
                 champs.append("{} = %s".format(cle))
                 if isinstance(val, (list, dict)):
                     valeurs.append(json.dumps(val))
@@ -198,14 +180,11 @@ def maj_profil(psid, **kwargs):
                     valeurs.append(val)
 
         if champs:
-            valeurs.append(psid)
-            cur.execute(
-                "UPDATE clients SET {}, derniere_interaction = %s WHERE psid = %s".format(
-                    ", ".join(champs),
-                    "%s"
-                ),
-                valeurs[:-1] + [datetime.datetime.now().isoformat(), psid]
+            valeurs.extend([datetime.datetime.now().isoformat(), psid])
+            requete = "UPDATE clients SET {}, derniere_interaction = %s WHERE psid = %s".format(
+                ", ".join(champs)
             )
+            cur.execute(requete, valeurs)
 
         conn.commit()
         cur.close()
@@ -385,13 +364,11 @@ def demarrer_commande(psid, sku, quantite=1):
 
 
 def valider_telephone(tel):
-    """Valide un numero camerounais. Formats acceptes : 6XXXXXXXX, +2376XXXXXXXX, 002376XXXXXXXX"""
+    """Valide un numero camerounais : 6XXXXXXXX (9 chiffres)"""
     if not tel:
         return False
-    tel_clean = re.sub(r"[^\d+]", "", str(tel))
-    # Enlever prefixe +237 ou 00237
-    tel_clean = re.sub(r"^(\+237|00237)", "", tel_clean)
-    # Doit commencer par 6 et faire 9 chiffres
+    tel_clean = re.sub(r"[^\d]", "", str(tel))
+    tel_clean = re.sub(r"^(237|00237)", "", tel_clean)
     return bool(re.match(r"^6\d{8}$", tel_clean))
 
 
@@ -402,6 +379,13 @@ def finaliser_commande(psid, nom_client, telephone, notes=""):
         commande = profil.get("commande_en_cours")
         if not commande:
             return {"erreur": "Aucune commande en cours"}
+
+        # Valider le telephone
+        if not valider_telephone(telephone):
+            return {
+                "erreur": "telephone_invalide",
+                "message": "Le numero de telephone n'est pas valide. Format attendu : 6XX XXX XXX (9 chiffres commencant par 6)."
+            }
 
         sku = commande.get("sku")
         quantite = int(commande.get("quantite") or 1)
@@ -424,10 +408,8 @@ def finaliser_commande(psid, nom_client, telephone, notes=""):
         cur.close()
         conn.close()
 
-        # Vider le brouillon
         maj_profil(psid, commande_en_cours=None, nom=nom_client, telephone=telephone)
 
-        # Notifier le commercial
         envoyer_notification_commande(
             commande_id, nom_client, telephone, commande.get("nom_produit"),
             quantite, prix_total, notes
@@ -448,7 +430,6 @@ def finaliser_commande(psid, nom_client, telephone, notes=""):
 def envoyer_notification_commande(commande_id, nom, telephone, produit,
                                     quantite, prix_total, notes=""):
     if not SMTP_USER or not SMTP_PASSWORD or not NOTIF_EMAIL:
-        log("WARN", "Email non configure")
         return False
     try:
         msg = MIMEMultipart()
@@ -536,7 +517,7 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "finaliser_commande",
-            "description": "Finalise la commande. Utilise UNIQUEMENT quand tu as nom ET telephone valides.",
+            "description": "Finalise la commande avec le nom et le telephone du client.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -596,7 +577,7 @@ SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materie
 
 === REGLES ABSOLUES ===
 1. Tu ne proposes QUE les produits retournes par les outils.
-2. INTERDICTION de mentionner : Chromebook, tablette, iPad, reconditionne, occasion, partenaire externe, pack etudiant, carte graphique, sac, casque, cable HDMI, ou tout produit absent du catalogue.
+2. INTERDICTION de mentionner : Chromebook, tablette, iPad, reconditionne, occasion, partenaire externe, pack etudiant, carte graphique, sac, casque, cable HDMI.
 3. Categories reelles : PC portable, PC fixe, Ecran, Composant, Accessoire.
 4. N'invente JAMAIS de prix.
 
@@ -617,27 +598,19 @@ Client qui cherche un produit :
 Client qui demande un produit absent :
 - Dis simplement "Nous n'avons pas ce produit en catalogue."
 - Ne propose PAS d'autres categories differentes
-- Si possible, propose un produit REEL de la MEME categorie
 
 Client qui veut commander :
-- Etape 1 : Confirme le produit et la quantite
-  Exemple : "Tres bon choix ! Samsung S24R350 a 120 000 FCFA. Combien d'unites ?"
-- Etape 2 : Appelle demarrer_commande(sku, quantite)
-- Etape 3 : Demande le nom complet
-- Etape 4 : Demande le telephone
-- Etape 5 : Verifie le format du telephone (doit commencer par 6 et faire 9 chiffres)
-- Etape 6 : Appelle finaliser_commande(nom_client, telephone)
-- Etape 7 : Confirme au client : "Commande enregistree. Un conseiller vous rappellera."
+Etape 1 : Confirme le produit et la quantite
+Etape 2 : Appelle demarrer_commande(sku, quantite)
+Etape 3 : Demande le nom complet
+Etape 4 : Demande le telephone
+Etape 5 : Appelle finaliser_commande(nom_client, telephone)
+Etape 6 : Confirme : "Commande enregistree. Un conseiller vous rappellera."
 
-IMPORTANT pour la commande :
+IMPORTANT :
 - UNE SEULE question a la fois
 - Ne demande pas nom + telephone dans le meme message
-- Si le client donne un telephone invalide, redemande poliment
-- Si le client hesite, rassure-le
-
-Client qui salue :
-- Reponse courte (1-2 phrases)
-- Demande ce qu'il cherche
+- Si telephone invalide, redemande poliment
 
 === STYLE ===
 - Naturel, direct, chaleureux
@@ -646,11 +619,51 @@ Client qui salue :
 
 
 # ====================================================================
+# NETTOYAGE POUR SECOND APPEL
+# ====================================================================
+def nettoyer_pour_final(messages):
+    """Prepare les messages pour le second appel IA (sans outils)."""
+    resultat = []
+    for m in messages:
+        role = m.get("role")
+        if role == "assistant" and m.get("tool_calls"):
+            texte = m.get("content") or ""
+            if texte:
+                resultat.append({"role": "assistant", "content": texte})
+        elif role == "tool":
+            contenu = m.get("content", "")
+            try:
+                data = json.loads(contenu) if isinstance(contenu, str) else contenu
+                if isinstance(data, list):
+                    lignes = []
+                    for item in data[:5]:
+                        if isinstance(item, dict):
+                            if item.get("nom"):
+                                lignes.append("- {} : {}".format(
+                                    item.get("nom"), f(item.get("prix", 0))))
+                            elif item.get("message"):
+                                lignes.append(item["message"])
+                    if lignes:
+                        contenu = "\n".join(lignes)
+            except Exception:
+                pass
+            resultat.append({
+                "role": "system",
+                "content": "Resultat de l'outil :\n" + str(contenu)[:800]
+            })
+        else:
+            resultat.append(m)
+    return resultat
+
+
+# ====================================================================
 # APPEL IA
 # ====================================================================
 def appeler_ia(messages, avec_outils=True, force_outil=False):
     if not client_ia:
         return None
+    if not avec_outils:
+        messages = nettoyer_pour_final(messages)
     for modele in MODELES_GROQ:
         try:
             kwargs = {
@@ -702,34 +715,98 @@ def executer_outil(nom, args, psid):
         return {"erreur": "Erreur execution outil"}
 
 
+# ====================================================================
+# FALLBACK : construction manuelle de la reponse
+# ====================================================================
+def construire_reponse_fallback(messages):
+    """Construit une reponse lisible quand le second appel IA echoue."""
+    try:
+        for m in reversed(messages):
+            if m.get("role") == "tool":
+                contenu = m.get("content", "")
+                try:
+                    data = json.loads(contenu) if isinstance(contenu, str) else contenu
+                except Exception:
+                    continue
+
+                if isinstance(data, list) and data:
+                    premier = data[0]
+
+                    # Cas aucun resultat
+                    if premier.get("aucun_resultat"):
+                        msg = premier.get("message", "Aucun produit ne correspond.")
+                        if premier.get("prix_minimum_cette_categorie"):
+                            msg += "\n\nNotre produit le moins cher dans cette categorie est a {}.".format(
+                                f(premier["prix_minimum_cette_categorie"]))
+                        if premier.get("categories_disponibles"):
+                            msg += "\n\nCategories disponibles :"
+                            for c in premier["categories_disponibles"]:
+                                msg += "\n• {} - a partir de {}".format(
+                                    c["nom"], f(c["prix_min"]))
+                        return msg
+
+                    # Cas enregistrer_commande
+                    if premier.get("succes") and premier.get("commande_id"):
+                        d = premier
+                        return ("Commande #{} enregistree !\n\n"
+                                "Produit : {}\nQuantite : {}\nTotal : {}\n\n"
+                                "Un conseiller vous rappellera dans les plus brefs delais.").format(
+                            d["commande_id"], d.get("produit"),
+                            d.get("quantite"), f(d.get("prix_total", 0)))
+
+                    # Cas demarrer_commande
+                    if premier.get("commande"):
+                        cmd = premier["commande"]
+                        return "Tres bon choix ! {} a {}. Pour finaliser, quel est votre nom complet ?".format(
+                            cmd.get("nom_produit"), f(cmd.get("prix_unitaire", 0)))
+
+                    # Cas telephone invalide
+                    if premier.get("erreur") == "telephone_invalide":
+                        return premier.get("message", "Le telephone est invalide. Format : 6XX XXX XXX.")
+
+                    # Cas produits trouves
+                    produits_valides = [p for p in data if p.get("nom")]
+                    if produits_valides:
+                        rep = "Voici ce que je vous propose :\n\n"
+                        for p in produits_valides[:3]:
+                            rep += "• {} - {}\n".format(p["nom"], f(p["prix"]))
+                        rep += "\nLequel vous interesse ?"
+                        return rep
+
+            if m.get("role") == "assistant" and m.get("content"):
+                return m["content"]
+
+        return "Je n'ai pas bien compris. Pouvez-vous reformuler ?"
+    except Exception as e:
+        log("ERR", "construire_reponse_fallback: " + str(e))
+        return "Pouvez-vous reformuler votre demande ?"
+
+
+# ====================================================================
+# REPONSE IA
+# ====================================================================
 def repondre_avec_ia(psid, message_client):
     if not client_ia:
         return "Bonjour ! Le service est en cours de configuration."
 
     try:
-        # Charger profil client (memoire longue)
         profil = charger_profil(psid)
 
-        # Construire le contexte client
         contexte_client = ""
         if profil.get("nom"):
             contexte_client += "\nNom du client (deja connu) : {}".format(profil["nom"])
         if profil.get("telephone"):
             contexte_client += "\nTelephone (deja connu) : {}".format(profil["telephone"])
-        if profil.get("budget"):
-            contexte_client += "\nBudget evoque : {}".format(profil["budget"])
         if profil.get("commande_en_cours"):
             cmd = profil["commande_en_cours"]
             contexte_client += "\nCommande en cours : {} x {} (etape: {})".format(
-                cmd.get("quantite", 1), cmd.get("nom_produit"), cmd.get("etape")
-            )
+                cmd.get("quantite", 1), cmd.get("nom_produit"), cmd.get("etape"))
 
         system_complet = SYSTEM_PROMPT
         if contexte_client:
             system_complet += "\n\n=== CONTEXTE CLIENT ===\n" + contexte_client
-            system_complet += "\n\nUtilise ces informations : ne redemande PAS ce que le client a deja donne."
+            system_complet += "\n\nUtilise ces infos : ne redemande PAS ce que le client a deja donne."
 
-        # Historique long (30 messages)
         historique = charger_historique(psid, limite=30)
 
         messages = [{"role": "system", "content": system_complet}]
@@ -741,7 +818,7 @@ def repondre_avec_ia(psid, message_client):
                          "batterie", "chargeur", "accessoire", "composant", "fixe", "tour",
                          "montre", "affiche", "liste", "catalogue", "stock", "prix", "cherche",
                          "veux", "besoin", "dispo", "combien", "commande", "acheter",
-                         "commander", "prends", "prend"]
+                         "commander", "prends", "prend", "oui", "ok"]
         forcer = any(m in low for m in mots_produits)
 
         response = appeler_ia(messages, avec_outils=True, force_outil=forcer)
@@ -797,17 +874,19 @@ def repondre_avec_ia(psid, message_client):
                     log("ERR", "traitement tool_call: " + str(e))
                     continue
 
+            # Second appel IA
             response2 = appeler_ia(messages, avec_outils=False)
             reponse = None
             if response2:
                 try:
                     reponse = response2.choices[0].message.content
-                except Exception:
-                    pass
-            if not reponse:
-                reponse = "J'ai trouve des produits mais je n'arrive pas a formuler la reponse."
+                except Exception as e:
+                    log("WARN", "Parse response2: " + str(e))
 
-            # Post-traitement
+            # Fallback si echec
+            if not reponse:
+                reponse = construire_reponse_fallback(messages)
+
             reponse = formater_reponse(reponse)
 
             if produit_photo:
@@ -880,7 +959,7 @@ def envoyer_photo(psid, sku):
 def accueil():
     return jsonify({
         "status": "ok",
-        "version": "v2",
+        "version": "v2.1",
         "bot": "WeloobeAI Chatbot",
         "ia": "connectee" if client_ia else "non configuree",
         "db": "connectee" if DATABASE_URL else "non configuree",
@@ -968,7 +1047,6 @@ def init_database():
             )
         """)
 
-        # Table clients enrichie (memoire longue)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS clients (
                 psid TEXT PRIMARY KEY,
@@ -1018,7 +1096,6 @@ def init_database():
             )
         """)
 
-        # Ajouts de colonnes si la table existait deja
         for alter in [
             "ALTER TABLE clients ADD COLUMN IF NOT EXISTS nom TEXT",
             "ALTER TABLE clients ADD COLUMN IF NOT EXISTS telephone TEXT",
@@ -1035,7 +1112,6 @@ def init_database():
 
         conn.commit()
 
-        # Import produits
         cur.execute("SELECT COUNT(*) AS n FROM produits")
         row = cur.fetchone()
         if (row.get("n") or 0) == 0:
@@ -1069,7 +1145,7 @@ def init_database():
 
         cur.close()
         conn.close()
-        log("DB", "Base v2 initialisee")
+        log("DB", "Base v2.1 initialisee")
     except Exception as e:
         log("ERR", "init_database: " + str(e))
 
@@ -1085,7 +1161,7 @@ except Exception as e:
 # ====================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Bot Messenger WeloobeAI v2")
+    print("  Bot Messenger WeloobeAI v2.1")
     print("  IA    : {}".format("connectee" if client_ia else "NON"))
     print("  DB    : {}".format("connectee" if DATABASE_URL else "NON"))
     print("  Email : {}".format("configure" if SMTP_USER else "NON"))
