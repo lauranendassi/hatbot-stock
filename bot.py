@@ -1,18 +1,23 @@
 # -*- coding: utf-8 -*-
-"""Bot Messenger WeloobeAI — IA Groq robuste, naturelle, anti-hallucination.
-   - Force l'appel d'outils sur les questions produits
-   - Filtre categorie robuste (accents, casse)
-   - Reponses honnetes et naturelles
+"""Bot Messenger WeloobeAI v2
+   - Memoire conversationnelle longue + profil client
+   - Post-traitement des reponses (formatage Messenger)
+   - Machine a etats pour la prise de commande
 """
 import os
+import re
 import json
+import smtplib
 import datetime
 import unicodedata
 import traceback
 import requests
 import psycopg2
 import psycopg2.extras
-from flask import Flask, request, jsonify
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from pathlib import Path
+from flask import Flask, request, jsonify, send_from_directory
 from openai import OpenAI
 
 # ====================================================================
@@ -22,12 +27,15 @@ PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN", "")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "weloobe_verify_2026_secure")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
+NOTIF_EMAIL = os.environ.get("NOTIF_EMAIL", "")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "https://hatbot-stock.onrender.com")
 
 MODELES_GROQ = [
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
     "llama-3.1-8b-instant",
-    "llama-3.1-70b-versatile",
 ]
 
 app = Flask(__name__)
@@ -83,10 +91,133 @@ def log(prefixe, message):
 
 
 # ====================================================================
+# POST-TRAITEMENT DES REPONSES
+# ====================================================================
+def formater_reponse(texte):
+    """Nettoie le texte pour un affichage Messenger optimal."""
+    if not texte:
+        return ""
+    try:
+        # Retirer le Markdown qui s'affiche mal sur Messenger
+        texte = re.sub(r"\*\*(.+?)\*\*", r"\1", texte)  # **gras**
+        texte = re.sub(r"\*(.+?)\*", r"\1", texte)       # *italique*
+        texte = re.sub(r"__(.+?)__", r"\1", texte)
+        texte = re.sub(r"_(.+?)_", r"\1", texte)
+        texte = re.sub(r"`(.+?)`", r"\1", texte)
+        texte = re.sub(r"^#+\s*", "", texte, flags=re.MULTILINE)
+
+        # Remplacer les puces Markdown par des puces propres
+        texte = re.sub(r"^\s*[-*]\s+", "• ", texte, flags=re.MULTILINE)
+
+        # Retirer les tableaux Markdown (| col | col |)
+        lignes = []
+        for ligne in texte.split("\n"):
+            if ligne.strip().startswith("|") and ligne.strip().endswith("|"):
+                if set(ligne.replace("|", "").replace("-", "").replace(":", "").strip()) == set():
+                    continue  # ligne de separation
+                cells = [c.strip() for c in ligne.strip("|").split("|")]
+                ligne = " • ".join(c for c in cells if c)
+            lignes.append(ligne)
+        texte = "\n".join(lignes)
+
+        # Nettoyer les espaces multiples et lignes vides consecutives
+        texte = re.sub(r"\n{3,}", "\n\n", texte)
+        texte = re.sub(r"[ \t]+", " ", texte)
+        texte = texte.strip()
+
+        # Limiter la longueur
+        if len(texte) > 1800:
+            texte = texte[:1797] + "..."
+
+        return texte
+    except Exception as e:
+        log("WARN", "formater_reponse: " + str(e))
+        return texte[:1800] if texte else ""
+
+
+# ====================================================================
+# PROFIL CLIENT
+# ====================================================================
+def charger_profil(psid):
+    """Charge le profil enrichi du client."""
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM clients WHERE psid = %s", (psid,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return {
+                "psid": psid,
+                "nom": None,
+                "telephone": None,
+                "budget": None,
+                "derniers_produits_vus": [],
+                "commande_en_cours": None
+            }
+        profil = dict(row)
+        # Parse JSON des derniers produits vus
+        for champ in ["derniers_produits_vus", "commande_en_cours"]:
+            if profil.get(champ):
+                try:
+                    profil[champ] = json.loads(profil[champ])
+                except Exception:
+                    profil[champ] = [] if champ == "derniers_produits_vus" else None
+            else:
+                profil[champ] = [] if champ == "derniers_produits_vus" else None
+        return profil
+    except Exception as e:
+        log("WARN", "charger_profil: " + str(e))
+        return {"psid": psid}
+
+
+def maj_profil(psid, **kwargs):
+    """Met a jour le profil client."""
+    try:
+        conn = db()
+        cur = conn.cursor()
+
+        # S'assurer que le client existe
+        cur.execute("SELECT psid FROM clients WHERE psid = %s", (psid,))
+        if not cur.fetchone():
+            cur.execute(
+                "INSERT INTO clients (psid, derniere_interaction) VALUES (%s, %s)",
+                (psid, datetime.datetime.now().isoformat())
+            )
+
+        # Mise a jour des champs
+        champs = []
+        valeurs = []
+        for cle, val in kwargs.items():
+            if val is not None:
+                champs.append("{} = %s".format(cle))
+                if isinstance(val, (list, dict)):
+                    valeurs.append(json.dumps(val))
+                else:
+                    valeurs.append(val)
+
+        if champs:
+            valeurs.append(psid)
+            cur.execute(
+                "UPDATE clients SET {}, derniere_interaction = %s WHERE psid = %s".format(
+                    ", ".join(champs),
+                    "%s"
+                ),
+                valeurs[:-1] + [datetime.datetime.now().isoformat(), psid]
+            )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log("WARN", "maj_profil: " + str(e))
+
+
+# ====================================================================
 # OUTILS POUR L'IA
 # ====================================================================
 def chercher_produits(requete="", budget_max=0, categorie=""):
-    """Cherche des produits. Filtre robuste par categorie, mots-cles et budget."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -104,10 +235,8 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
             budget_max = float(budget_max) if budget_max else 0
         except Exception:
             budget_max = 0
-
         cat_norm = normaliser(categorie) if categorie else ""
 
-        # Etape 1 : filtrer par categorie
         candidats = []
         for p in tous:
             cat_prod_norm = normaliser(p.get("categorie") or "")
@@ -116,7 +245,6 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
                     continue
             candidats.append(p)
 
-        # Etape 2 : filtrer par mots-cles
         if tokens:
             filtres = []
             for p in candidats:
@@ -128,23 +256,19 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
                 filtres.sort(key=lambda x: -x[0])
                 candidats = [p for _, p in filtres]
 
-        # Etape 3 : filtrer par budget
         if budget_max:
             candidats = [p for p in candidats if (p.get("prix_vente") or 0) <= budget_max]
 
-        # Etape 4 : trier par prix croissant
         candidats.sort(key=lambda p: p.get("prix_vente") or 0)
 
-        # Resultats trouves
         if candidats:
             return [{
                 "sku": p.get("sku"),
                 "nom": p.get("nom"),
                 "categorie": p.get("categorie"),
                 "prix": p.get("prix_vente")
-            } for p in candidats[:5]]
+            } for p in candidats[:3]]
 
-        # Aucun resultat : message honnete avec le VRAI prix minimum de la categorie
         if cat_norm:
             prix_cat = []
             for p in tous:
@@ -154,16 +278,14 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
                     if prix > 0:
                         prix_cat.append(prix)
             prix_min = min(prix_cat) if prix_cat else 0
-
             return [{
                 "aucun_resultat": True,
                 "categorie_demandee": categorie,
                 "budget_demande": budget_max,
                 "prix_minimum_cette_categorie": prix_min,
-                "instruction": "Aucun produit de cette categorie ne rentre dans le budget. Cite le prix REEL minimum et propose UNE alternative REELLE du catalogue. N'invente AUCUN produit ni marque."
+                "instruction": "Aucun produit de cette categorie ne rentre dans le budget. Cite le prix REEL minimum et propose UNE alternative REELLE."
             }]
 
-        # Aucune categorie : donner les vraies categories du catalogue
         categories_reelles = {}
         for p in tous:
             cat = p.get("categorie") or "Autre"
@@ -181,16 +303,14 @@ def chercher_produits(requete="", budget_max=0, categorie=""):
                 {"nom": cat, "prix_min": prix}
                 for cat, prix in sorted(categories_reelles.items(), key=lambda x: x[1])
             ],
-            "instruction": "Aucun produit ne correspond. Cite UNIQUEMENT les categories REELLES avec leur prix minimum REEL. N'invente RIEN."
+            "instruction": "Aucun produit ne correspond. Cite UNIQUEMENT les categories REELLES avec prix minimum REEL."
         }]
-
     except Exception as e:
         log("ERR", "chercher_produits traitement: " + str(e))
         return [{"erreur": "Erreur lors de la recherche"}]
 
 
 def verifier_stock(sku):
-    """Verifie le stock d'un produit."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -201,7 +321,7 @@ def verifier_stock(sku):
         cur.close()
         conn.close()
         if not p:
-            return {"erreur": "Produit inconnu dans le catalogue"}
+            return {"erreur": "Produit inconnu"}
         stock = (p.get("stock_initial") or 0) - (vendu.get("q") or 0)
         return {
             "sku": sku,
@@ -216,7 +336,6 @@ def verifier_stock(sku):
 
 
 def lister_catalogue():
-    """Liste tout le catalogue."""
     try:
         conn = db()
         cur = conn.cursor()
@@ -237,18 +356,143 @@ def lister_catalogue():
         return [{"erreur": "Catalogue indisponible"}]
 
 
+def demarrer_commande(psid, sku, quantite=1):
+    """Demarre une commande (brouillon)."""
+    try:
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("SELECT nom, prix_vente FROM produits WHERE sku = %s", (sku,))
+        p = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not p:
+            return {"erreur": "Produit inconnu"}
+
+        commande = {
+            "sku": sku,
+            "nom_produit": p.get("nom"),
+            "prix_unitaire": p.get("prix_vente"),
+            "quantite": quantite,
+            "etape": "nom",
+            "nom_client": None,
+            "telephone": None
+        }
+        maj_profil(psid, commande_en_cours=commande)
+        return {"succes": True, "commande": commande}
+    except Exception as e:
+        log("ERR", "demarrer_commande: " + str(e))
+        return {"erreur": "Impossible de demarrer la commande"}
+
+
+def valider_telephone(tel):
+    """Valide un numero camerounais. Formats acceptes : 6XXXXXXXX, +2376XXXXXXXX, 002376XXXXXXXX"""
+    if not tel:
+        return False
+    tel_clean = re.sub(r"[^\d+]", "", str(tel))
+    # Enlever prefixe +237 ou 00237
+    tel_clean = re.sub(r"^(\+237|00237)", "", tel_clean)
+    # Doit commencer par 6 et faire 9 chiffres
+    return bool(re.match(r"^6\d{8}$", tel_clean))
+
+
+def finaliser_commande(psid, nom_client, telephone, notes=""):
+    """Enregistre la commande finale."""
+    try:
+        profil = charger_profil(psid)
+        commande = profil.get("commande_en_cours")
+        if not commande:
+            return {"erreur": "Aucune commande en cours"}
+
+        sku = commande.get("sku")
+        quantite = int(commande.get("quantite") or 1)
+        prix_unitaire = commande.get("prix_unitaire") or 0
+        prix_total = prix_unitaire * quantite
+
+        conn = db()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO commandes
+            (psid, nom_client, telephone, sku, nom_produit, quantite,
+             prix_unitaire, prix_total, statut, notes, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (psid, nom_client, telephone, sku, commande.get("nom_produit"),
+              quantite, prix_unitaire, prix_total, "nouvelle", notes,
+              datetime.datetime.now().isoformat()))
+        commande_id = cur.fetchone()["id"]
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Vider le brouillon
+        maj_profil(psid, commande_en_cours=None, nom=nom_client, telephone=telephone)
+
+        # Notifier le commercial
+        envoyer_notification_commande(
+            commande_id, nom_client, telephone, commande.get("nom_produit"),
+            quantite, prix_total, notes
+        )
+
+        return {
+            "succes": True,
+            "commande_id": commande_id,
+            "produit": commande.get("nom_produit"),
+            "quantite": quantite,
+            "prix_total": prix_total
+        }
+    except Exception as e:
+        log("ERR", "finaliser_commande: " + str(e))
+        return {"erreur": "Impossible d'enregistrer la commande"}
+
+
+def envoyer_notification_commande(commande_id, nom, telephone, produit,
+                                    quantite, prix_total, notes=""):
+    if not SMTP_USER or not SMTP_PASSWORD or not NOTIF_EMAIL:
+        log("WARN", "Email non configure")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = SMTP_USER
+        msg["To"] = NOTIF_EMAIL
+        msg["Subject"] = "Nouvelle commande #{} - WeloobeAI".format(commande_id)
+        corps = """Nouvelle commande recue via Messenger.
+
+Commande #{cid}
+-------------------------------------
+Client      : {nom}
+Telephone   : {tel}
+Produit     : {prod}
+Quantite    : {qte}
+Prix total  : {prix}
+Notes       : {notes}
+-------------------------------------""".format(
+            cid=commande_id, nom=nom, tel=telephone,
+            prod=produit, qte=quantite, prix=prix_total,
+            notes=notes or "aucune"
+        )
+        msg.attach(MIMEText(corps, "plain", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+        log("EMAIL", "Notification envoyee")
+        return True
+    except Exception as e:
+        log("ERR", "envoyer_notification: " + str(e))
+        return False
+
+
 OUTILS = [
     {
         "type": "function",
         "function": {
             "name": "chercher_produits",
-            "description": "Cherche des produits dans le catalogue WeloobeAI. Filtre par categorie, mots-cles et budget. Retourne UNIQUEMENT les produits existants.",
+            "description": "Cherche des produits dans le catalogue",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "requete": {"type": "string", "description": "Mots-cles de recherche"},
-                    "budget_max": {"type": "number", "description": "Budget maximum en FCFA (0 si non specifie)"},
-                    "categorie": {"type": "string", "description": "Categorie : PC portable, PC fixe, Ecran, Composant ou Accessoire"}
+                    "requete": {"type": "string"},
+                    "budget_max": {"type": "number"},
+                    "categorie": {"type": "string"}
                 }
             }
         }
@@ -257,7 +501,7 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "verifier_stock",
-            "description": "Verifie la disponibilite d'un produit par son SKU",
+            "description": "Verifie la disponibilite d'un produit par SKU",
             "parameters": {
                 "type": "object",
                 "properties": {"sku": {"type": "string"}},
@@ -269,8 +513,39 @@ OUTILS = [
         "type": "function",
         "function": {
             "name": "lister_catalogue",
-            "description": "Liste TOUS les produits du catalogue WeloobeAI",
+            "description": "Liste tous les produits du catalogue",
             "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "demarrer_commande",
+            "description": "Demarre une commande. Utilise UNIQUEMENT quand le client a confirme le produit et la quantite.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string"},
+                    "quantite": {"type": "integer"}
+                },
+                "required": ["sku"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "finaliser_commande",
+            "description": "Finalise la commande. Utilise UNIQUEMENT quand tu as nom ET telephone valides.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nom_client": {"type": "string"},
+                    "telephone": {"type": "string"},
+                    "notes": {"type": "string"}
+                },
+                "required": ["nom_client", "telephone"]
+            }
         }
     }
 ]
@@ -279,7 +554,7 @@ OUTILS = [
 # ====================================================================
 # HISTORIQUE
 # ====================================================================
-def charger_historique(psid, limite=10):
+def charger_historique(psid, limite=30):
     try:
         conn = db()
         cur = conn.cursor()
@@ -320,91 +595,75 @@ def enregistrer_message(psid, role, contenu):
 SYSTEM_PROMPT = """Tu es l'assistant commercial de WeloobeAI, magasin de materiel informatique a Yaounde, Cameroun.
 
 === REGLES ABSOLUES ===
-1. Tu ne proposes QUE les produits retournes par les outils. Tu n'inventes JAMAIS un produit, marque, modele ou prix.
-2. INTERDICTION FORMELLE de mentionner : Chromebook, tablette, iPad, reconditionne, occasion, partenaire externe, pack etudiant, carte graphique, sac, casque, support ecran.
-3. Tu ne mentionnes QUE les categories reelles : PC portable, PC fixe, Ecran, Composant, Accessoire.
-4. JAMAIS de produits d'occasion ou reconditionnes.
+1. Tu ne proposes QUE les produits retournes par les outils.
+2. INTERDICTION de mentionner : Chromebook, tablette, iPad, reconditionne, occasion, partenaire externe, pack etudiant, carte graphique, sac, casque, cable HDMI, ou tout produit absent du catalogue.
+3. Categories reelles : PC portable, PC fixe, Ecran, Composant, Accessoire.
+4. N'invente JAMAIS de prix.
 
-=== COMPORTEMENT NATUREL ===
+=== FORMAT DES REPONSES ===
+- Pas d'asterisques, pas de **, pas de #, pas de tableaux Markdown
+- Utilise des puces simples avec le caractere •
+- Reponses courtes : 1 a 3 phrases + liste si necessaire
+- Un seul emoji maximum
+- Pas de "je suis la pour vous aider" repetitif
 
-Quand un client cherche un produit SANS budget :
-- Utilise chercher_produits avec la categorie appropriee
-- Presente 2-3 modeles avec LEUR PRIX REEL
-- Ne demande pas de budget d'abord : montre ce que tu as
+=== COMPORTEMENT ===
 
-Quand un client demande un produit ABSENT du catalogue (cable HDMI, souris, sac...) :
-- Dis simplement : "Nous n'avons pas ce produit en catalogue."
-- NE MENTIONNE PAS de prix, meme pour dire "0 FCFA"
-- Propose ce que tu as REELLEMENT dans la MEME categorie
-  - Exemple : client demande cable HDMI -> propose nos accessoires reels
-  - Exemple : client demande sac -> dis que tu n'en as pas et propose autre chose
-- Ne saute PAS d'une categorie a l'autre (pas de "on a des PC portables" quand on parle d'accessoires)
+Client qui cherche un produit :
+- Utilise chercher_produits
+- Presente 2-3 produits max avec LEUR PRIX REEL
+- Format : "• [nom] - [prix]"
 
-Quand un client donne un budget TROP BAS :
-- Cite le prix REEL du produit le moins cher de la categorie
-- Propose UNE seule alternative REELLE
-- Exemple : "Nos PC portables demarrent a 465 000 FCFA. Preferez-vous voir nos ecrans a partir de 120 000 FCFA ?"
+Client qui demande un produit absent :
+- Dis simplement "Nous n'avons pas ce produit en catalogue."
+- Ne propose PAS d'autres categories differentes
+- Si possible, propose un produit REEL de la MEME categorie
 
-Quand un client decrit un USAGE precis :
-- Cherche les produits adaptes
-- Explique POURQUOI ce modele convient
-- Ne pose pas 3 questions d'un coup
+Client qui veut commander :
+- Etape 1 : Confirme le produit et la quantite
+  Exemple : "Tres bon choix ! Samsung S24R350 a 120 000 FCFA. Combien d'unites ?"
+- Etape 2 : Appelle demarrer_commande(sku, quantite)
+- Etape 3 : Demande le nom complet
+- Etape 4 : Demande le telephone
+- Etape 5 : Verifie le format du telephone (doit commencer par 6 et faire 9 chiffres)
+- Etape 6 : Appelle finaliser_commande(nom_client, telephone)
+- Etape 7 : Confirme au client : "Commande enregistree. Un conseiller vous rappellera."
 
-Quand un client dit juste "bonjour" :
-- Reponse courte et chaleureuse (1-2 phrases)
+IMPORTANT pour la commande :
+- UNE SEULE question a la fois
+- Ne demande pas nom + telephone dans le meme message
+- Si le client donne un telephone invalide, redemande poliment
+- Si le client hesite, rassure-le
+
+Client qui salue :
+- Reponse courte (1-2 phrases)
 - Demande ce qu'il cherche
-
-Quand un client confirme un achat :
-- Felicite, recapitule le produit et le prix
-- Propose de passer commande : "Souhaitez-vous commander ? Un conseiller vous contactera."
-
-Quand un client pose une question vague :
-- Demande une precision, mais UNE seule question a la fois
-- Exemple : "Vous cherchez pour quel usage ?" (pas 3 questions d'un coup)
 
 === STYLE ===
 - Naturel, direct, chaleureux
-- Phrases courtes, pas de listes a rallonge
-- Ne repete PAS "je suis la pour vous aider" ou "je suis a votre disposition"
-- Un seul emoji maximum par reponse
-- Reponds toujours en francais
-
-=== EXEMPLES DE REPONSES NATURELLES ===
-
-Client : "montre-moi les ecrans"
-Toi : [appelle chercher_produits(categorie="Ecran")]
-      "Voici nos ecrans disponibles : [liste avec prix reels]. Lequel vous interesse ?"
-
-Client : "je cherche un PC pour ma fille etudiante"
-Toi : [appelle chercher_produits(categorie="PC portable")]
-      "Voici ce que nous avons : [liste avec prix reels]. Quel budget avez-vous ?"
-
-=== CATEGORIES REELLES ===
-PC portable, PC fixe, Ecran, Composant, Accessoire."""
+- Une question a la fois
+- Reponds en francais"""
 
 
 # ====================================================================
 # APPEL IA
 # ====================================================================
 def appeler_ia(messages, avec_outils=True, force_outil=False):
-    """Appelle Groq avec fallback. Si force_outil, exige l'appel d'un outil."""
     if not client_ia:
         return None
-
     for modele in MODELES_GROQ:
         try:
             kwargs = {
                 "model": modele,
                 "messages": messages,
-                "temperature": 0.5,
-                "max_tokens": 500
+                "temperature": 0.4,
+                "max_tokens": 600
             }
             if avec_outils:
                 kwargs["tools"] = OUTILS
                 kwargs["tool_choice"] = "required" if force_outil else "auto"
-
             response = client_ia.chat.completions.create(**kwargs)
-            log("IA", "Modele utilise : " + modele + (" [outil force]" if force_outil else ""))
+            log("IA", "Modele : " + modele + (" [force]" if force_outil else ""))
             return response
         except Exception as e:
             log("WARN", "Modele {} echoue : {}".format(modele, str(e)[:200]))
@@ -412,8 +671,7 @@ def appeler_ia(messages, avec_outils=True, force_outil=False):
     return None
 
 
-def executer_outil(nom, args):
-    """Execute un outil."""
+def executer_outil(nom, args, psid):
     try:
         if nom == "chercher_produits":
             return chercher_produits(
@@ -425,6 +683,19 @@ def executer_outil(nom, args):
             return verifier_stock(args.get("sku", ""))
         elif nom == "lister_catalogue":
             return lister_catalogue()
+        elif nom == "demarrer_commande":
+            return demarrer_commande(
+                psid,
+                args.get("sku", ""),
+                int(args.get("quantite", 1))
+            )
+        elif nom == "finaliser_commande":
+            return finaliser_commande(
+                psid,
+                args.get("nom_client", ""),
+                args.get("telephone", ""),
+                args.get("notes", "")
+            )
         return {"erreur": "outil inconnu"}
     except Exception as e:
         log("ERR", "executer_outil: " + str(e))
@@ -432,22 +703,45 @@ def executer_outil(nom, args):
 
 
 def repondre_avec_ia(psid, message_client):
-    """Genere une reponse. Ne plante jamais."""
     if not client_ia:
-        return "Bonjour ! Je suis l'assistant WeloobeAI. Le service est en cours de configuration."
+        return "Bonjour ! Le service est en cours de configuration."
 
     try:
-        historique = charger_historique(psid, limite=10)
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Charger profil client (memoire longue)
+        profil = charger_profil(psid)
+
+        # Construire le contexte client
+        contexte_client = ""
+        if profil.get("nom"):
+            contexte_client += "\nNom du client (deja connu) : {}".format(profil["nom"])
+        if profil.get("telephone"):
+            contexte_client += "\nTelephone (deja connu) : {}".format(profil["telephone"])
+        if profil.get("budget"):
+            contexte_client += "\nBudget evoque : {}".format(profil["budget"])
+        if profil.get("commande_en_cours"):
+            cmd = profil["commande_en_cours"]
+            contexte_client += "\nCommande en cours : {} x {} (etape: {})".format(
+                cmd.get("quantite", 1), cmd.get("nom_produit"), cmd.get("etape")
+            )
+
+        system_complet = SYSTEM_PROMPT
+        if contexte_client:
+            system_complet += "\n\n=== CONTEXTE CLIENT ===\n" + contexte_client
+            system_complet += "\n\nUtilise ces informations : ne redemande PAS ce que le client a deja donne."
+
+        # Historique long (30 messages)
+        historique = charger_historique(psid, limite=30)
+
+        messages = [{"role": "system", "content": system_complet}]
         messages.extend(historique)
         messages.append({"role": "user", "content": message_client})
 
-        # Detecter si la question porte sur un produit -> forcer l'appel d'outil
         low = normaliser(message_client)
         mots_produits = ["pc", "ordinateur", "portable", "ecran", "moniteur", "ssd", "ram",
                          "batterie", "chargeur", "accessoire", "composant", "fixe", "tour",
                          "montre", "affiche", "liste", "catalogue", "stock", "prix", "cherche",
-                         "veux", "besoin", "dispo", "combien"]
+                         "veux", "besoin", "dispo", "combien", "commande", "acheter",
+                         "commander", "prends", "prend"]
         forcer = any(m in low for m in mots_produits)
 
         response = appeler_ia(messages, avec_outils=True, force_outil=forcer)
@@ -457,7 +751,7 @@ def repondre_avec_ia(psid, message_client):
         try:
             msg = response.choices[0].message
         except Exception:
-            return "Je n'ai pas bien compris. Pouvez-vous reformuler ?"
+            return "Je n'ai pas bien compris."
 
         tool_calls = getattr(msg, "tool_calls", None)
         if tool_calls:
@@ -476,6 +770,8 @@ def repondre_avec_ia(psid, message_client):
                 ]
             })
 
+            produit_photo = None
+
             for tool_call in tool_calls:
                 try:
                     nom_outil = tool_call.function.name
@@ -486,7 +782,11 @@ def repondre_avec_ia(psid, message_client):
                         args = {}
 
                     log("OUTIL", "{} ({})".format(nom_outil, args))
-                    resultat = executer_outil(nom_outil, args)
+                    resultat = executer_outil(nom_outil, args, psid)
+
+                    if nom_outil == "chercher_produits" and isinstance(resultat, list):
+                        if len(resultat) == 1 and resultat[0].get("sku"):
+                            produit_photo = resultat[0]
 
                     messages.append({
                         "role": "tool",
@@ -497,30 +797,34 @@ def repondre_avec_ia(psid, message_client):
                     log("ERR", "traitement tool_call: " + str(e))
                     continue
 
-            # Deuxieme appel (sans forcer, sans outils) pour formuler la reponse
             response2 = appeler_ia(messages, avec_outils=False)
+            reponse = None
             if response2:
                 try:
-                    contenu = response2.choices[0].message.content
-                    if contenu:
-                        return contenu
+                    reponse = response2.choices[0].message.content
                 except Exception:
                     pass
+            if not reponse:
+                reponse = "J'ai trouve des produits mais je n'arrive pas a formuler la reponse."
 
-            return "J'ai trouve des produits mais je n'arrive pas a formuler la reponse. Reformulez svp."
+            # Post-traitement
+            reponse = formater_reponse(reponse)
 
-        return msg.content or "Je n'ai pas bien compris."
+            if produit_photo:
+                envoyer_photo(psid, produit_photo["sku"])
+
+            return reponse
+
+        return formater_reponse(msg.content or "Je n'ai pas bien compris.")
 
     except Exception as e:
         log("ERR", "repondre_avec_ia: " + str(e))
         log("ERR", traceback.format_exc()[:500])
-        return "Je rencontre un souci technique. Pouvez-vous reformuler votre demande ?"
+        return "Je rencontre un souci technique."
 
 
 def envoyer_message(psid, texte):
-    """Envoie un message a Messenger."""
     if not PAGE_ACCESS_TOKEN:
-        log("ERR", "PAGE_ACCESS_TOKEN manquant")
         return False
     try:
         url = "https://graph.facebook.com/v20.0/me/messages"
@@ -535,17 +839,61 @@ def envoyer_message(psid, texte):
         return False
 
 
+def envoyer_photo(psid, sku):
+    try:
+        dossier = Path("photos")
+        if not dossier.exists():
+            return False
+        fichier = None
+        for ext in [".jpg", ".jpeg", ".png", ".JPG", ".PNG"]:
+            candidate = dossier / (sku + ext)
+            if candidate.exists():
+                fichier = candidate
+                break
+        if not fichier:
+            return False
+
+        url_image = "{}/photos/{}".format(PUBLIC_URL, fichier.name)
+        url = "https://graph.facebook.com/v20.0/me/messages"
+        params = {"access_token": PAGE_ACCESS_TOKEN}
+        payload = {
+            "recipient": {"id": psid},
+            "message": {
+                "attachment": {
+                    "type": "image",
+                    "payload": {"url": url_image, "is_reusable": True}
+                }
+            }
+        }
+        r = requests.post(url, params=params, json=payload, timeout=10)
+        log("PHOTO", "{} - {}".format(r.status_code, url_image))
+        return r.status_code == 200
+    except Exception as e:
+        log("ERR", "envoyer_photo: " + str(e))
+        return False
+
+
 # ====================================================================
-# WEBHOOK
+# ROUTES
 # ====================================================================
 @app.route("/", methods=["GET"])
 def accueil():
     return jsonify({
         "status": "ok",
-        "bot": "WeloobeAI Chatbot IA",
+        "version": "v2",
+        "bot": "WeloobeAI Chatbot",
         "ia": "connectee" if client_ia else "non configuree",
-        "db": "connectee" if DATABASE_URL else "non configuree"
+        "db": "connectee" if DATABASE_URL else "non configuree",
+        "email": "configure" if SMTP_USER else "non configure"
     })
+
+
+@app.route("/photos/<path:filename>")
+def servir_photo(filename):
+    try:
+        return send_from_directory("photos", filename)
+    except Exception:
+        return "Not found", 404
 
 
 @app.route("/webhook", methods=["GET"])
@@ -555,9 +903,7 @@ def webhook_verification():
         token = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
         if mode == "subscribe" and token == VERIFY_TOKEN:
-            log("WEBHOOK", "Verification OK")
             return challenge or "", 200
-        log("WEBHOOK", "Verification echouee")
         return "Forbidden", 403
     except Exception as e:
         log("ERR", "webhook_verification: " + str(e))
@@ -566,7 +912,6 @@ def webhook_verification():
 
 @app.route("/webhook", methods=["POST"])
 def webhook_reception():
-    """Recoit les evenements. Ne plante JAMAIS."""
     try:
         data = request.get_json(silent=True) or {}
         if data.get("object") != "page":
@@ -592,7 +937,6 @@ def webhook_reception():
 
                 except Exception as e:
                     log("ERR", "traitement event: " + str(e))
-                    log("ERR", traceback.format_exc()[:500])
                     continue
 
         return "EVENT_RECEIVED", 200
@@ -606,11 +950,8 @@ def webhook_reception():
 # INIT BASE
 # ====================================================================
 def init_database():
-    """Cree les tables. Ne plante jamais."""
     if not DATABASE_URL:
-        log("WARN", "Pas de DATABASE_URL, base non initialisee")
         return
-
     try:
         conn = db()
         cur = conn.cursor()
@@ -627,9 +968,15 @@ def init_database():
             )
         """)
 
+        # Table clients enrichie (memoire longue)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS clients (
                 psid TEXT PRIMARY KEY,
+                nom TEXT,
+                telephone TEXT,
+                budget INTEGER,
+                derniers_produits_vus TEXT,
+                commande_en_cours TEXT,
                 derniere_interaction TEXT
             )
         """)
@@ -654,20 +1001,41 @@ def init_database():
             )
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS commandes (
+                id SERIAL PRIMARY KEY,
+                psid TEXT,
+                nom_client TEXT,
+                telephone TEXT,
+                sku TEXT,
+                nom_produit TEXT,
+                quantite INTEGER,
+                prix_unitaire INTEGER,
+                prix_total INTEGER,
+                statut TEXT DEFAULT 'nouvelle',
+                notes TEXT,
+                timestamp TEXT
+            )
+        """)
+
+        # Ajouts de colonnes si la table existait deja
         for alter in [
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS nom TEXT",
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS telephone TEXT",
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS budget INTEGER",
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS derniers_produits_vus TEXT",
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS commande_en_cours TEXT",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS role TEXT",
             "ALTER TABLE messages ADD COLUMN IF NOT EXISTS timestamp TEXT",
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS psid TEXT",
-            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS contenu TEXT",
         ]:
             try:
                 cur.execute(alter)
-            except Exception as e:
-                log("WARN", "ALTER: " + str(e))
+            except Exception:
+                pass
 
         conn.commit()
 
-        # Import des produits si table vide
+        # Import produits
         cur.execute("SELECT COUNT(*) AS n FROM produits")
         row = cur.fetchone()
         if (row.get("n") or 0) == 0:
@@ -701,7 +1069,7 @@ def init_database():
 
         cur.close()
         conn.close()
-        log("DB", "Base initialisee")
+        log("DB", "Base v2 initialisee")
     except Exception as e:
         log("ERR", "init_database: " + str(e))
 
@@ -717,8 +1085,9 @@ except Exception as e:
 # ====================================================================
 if __name__ == "__main__":
     print("=" * 60)
-    print("  Bot Messenger WeloobeAI — IA Groq robuste")
-    print("  IA : {}".format("connectee" if client_ia else "NON"))
-    print("  DB : {}".format("connectee" if DATABASE_URL else "NON"))
+    print("  Bot Messenger WeloobeAI v2")
+    print("  IA    : {}".format("connectee" if client_ia else "NON"))
+    print("  DB    : {}".format("connectee" if DATABASE_URL else "NON"))
+    print("  Email : {}".format("configure" if SMTP_USER else "NON"))
     print("=" * 60)
     app.run(host="0.0.0.0", port=5000, debug=False)
