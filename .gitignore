@@ -1,0 +1,13 @@
+venv/
+__pycache__/
+*.xlsx
+data/
+logs/
+_sauvegardes/
+config.ini
+
+.env
+bot/.env
+bot/venv/
+version 1/
+*.bas

@@ -1,1 +1,0 @@
-# hatbot-stock

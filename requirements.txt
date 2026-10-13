@@ -1,6 +1,0 @@
-Flask
-requests
-gunicorn
-psycopg2-binary
-openpyxl
-openai
