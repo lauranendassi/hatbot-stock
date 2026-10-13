@@ -96,11 +96,6 @@ def traiter_evenement(ev: dict):
     with verrou(psid):
         messenger.indicateur_frappe(psid, True)
         try:
-            conv = db.base().conversation(psid)
-            if not conv["profil"].get("prenom") and not conv["profil"].get("prenom_cherche"):
-                conv["profil"]["prenom"] = messenger.prenom(psid)
-                conv["profil"]["prenom_cherche"] = True
-                db.base().enregistrer_conversation(conv)
             reponses = conversation.traiter(psid, texte)
         except Exception:
             log.exception("[%s] erreur de traitement", psid[-6:])

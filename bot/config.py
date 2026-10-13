@@ -48,7 +48,7 @@ GROQ_API_KEY = env("GROQ_API_KEY")
 GROQ_URL = env("GROQ_URL", "https://api.groq.com/openai/v1/chat/completions")
 MODELE_PRINCIPAL = env("MODELE_PRINCIPAL", "openai/gpt-oss-120b")
 MODELE_SECOURS = env("MODELE_SECOURS", "openai/gpt-oss-20b")
-IA_TIMEOUT = int(env("IA_TIMEOUT", "25"))
+IA_TIMEOUT = int(env("IA_TIMEOUT", "12"))     # au-delà, on passe au modèle de secours
 
 # --- Mémoire et conversation
 MEMOIRE_MESSAGES = int(env("MEMOIRE_MESSAGES", "30"))

@@ -63,23 +63,34 @@ def recharger_instructions():
 # Point d'entrée
 # ==========================================================================
 def traiter(psid: str, texte: str) -> list[str]:
-    """Traite un message client et renvoie la liste des messages texte à envoyer."""
+    """Traite un message client et renvoie la liste des messages texte à envoyer.
+    Base de données : 1 lecture groupée au début, 1 écriture groupée à la fin."""
+    import time
+    import messenger
+    debut = time.perf_counter()
     base = db.base()
-    conv = base.conversation(psid)
-    role = executer("verifier_permissions", {"action": "voir_catalogue", "psid": psid}).get("role", "client")
+    conv, role, historique = base.charger_tour(psid, config.MEMOIRE_MESSAGES)
+    t_lecture = time.perf_counter() - debut
     texte = (texte or "").strip()[:2000]
-    base.ajouter_message(psid, "user", texte)
+    historique.append({"role": "user", "contenu": texte})
+    conv["_hist"] = historique
     profil = conv["profil"]
-    profil.setdefault("prenom", None)
+    if not profil.get("prenom_cherche"):
+        profil["prenom"] = messenger.prenom(psid)
+        profil["prenom_cherche"] = True
     log.info("[%s] rôle=%s état=%s ← %s", psid[-6:], role, conv["etat"], texte[:120])
+    ia.DUREE_CUMULEE = 0.0
 
     reponses = _traiter(conv, role, texte)
 
-    for r in reponses:
-        base.ajouter_message(psid, "assistant", r)
+    conv.pop("_hist", None)
     profil["derniere_interaction"] = dt.datetime.now().isoformat(timespec="seconds")
-    base.enregistrer_conversation(conv)
+    t_ecriture = time.perf_counter()
+    base.sauvegarder_tour(conv, [("user", texte)] + [("assistant", r) for r in reponses])
+    t_ecriture = time.perf_counter() - t_ecriture
     log.info("[%s] → état=%s | %s", psid[-6:], conv["etat"], " / ".join(r[:100] for r in reponses))
+    log.info("[%s] ⏱ %.1fs au total (base : lecture %.2fs, écriture %.2fs | IA %.1fs)", psid[-6:],
+             time.perf_counter() - debut, t_lecture, t_ecriture, ia.DUREE_CUMULEE)
     return reponses
 
 
@@ -389,8 +400,11 @@ def generer_reponse(conv, role, directive, fiches, donnees, qualifie=True, quest
                         "\n\n".join(f"[{f.titre}]\n{f.contenu}" for f in fiches))
     systeme = INSTRUCTIONS + "\n\n=== CONTEXTE DU MESSAGE (généré par le système) ===\n" + "\n\n".join(contexte)
 
-    historique = db.base().historique(conv["psid"], config.MEMOIRE_MESSAGES)
-    messages = [{"role": m["role"], "content": m["contenu"]} for m in historique if m["role"] in ("user", "assistant")]
+    historique = conv.get("_hist")
+    if historique is None:
+        historique = db.base().historique(conv["psid"], config.MEMOIRE_MESSAGES)
+    messages = [{"role": m["role"], "content": m["contenu"]} for m in historique[-config.MEMOIRE_MESSAGES:]
+                if m["role"] in ("user", "assistant")]
     while messages and messages[0]["role"] != "user":
         messages.pop(0)
 
@@ -752,7 +766,7 @@ def transferer_humain(conv, motif, texte) -> list[str]:
     profil = conv["profil"]
     conv["etat"] = "HUMAIN"
     conv["handoff_jusqua"] = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=config.HANDOFF_HEURES)).isoformat()
-    derniers = db.base().historique(conv["psid"], 8)
+    derniers = (conv.get("_hist") or db.base().historique(conv["psid"], 8))[-8:]
     executer("notifier_email", {
         "type": "plainte" if motif == "PLAINTE" else "humain",
         "sujet": f"client {profil.get('prenom') or conv['psid'][-6:]}",

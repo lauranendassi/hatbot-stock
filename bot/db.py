@@ -114,6 +114,15 @@ class BaseMemoire:
     def dernieres_commandes(self, n=10):
         return deepcopy(self.commandes[-n:][::-1])
 
+    def charger_tour(self, psid, n):
+        """Conversation + rôle + historique, en une fois."""
+        return self.conversation(psid), self.role(psid), self.historique(psid, n)
+
+    def sauvegarder_tour(self, conv, messages):
+        for role, contenu in messages:
+            self.ajouter_message(conv["psid"], role, contenu)
+        self.enregistrer_conversation(conv)
+
     def produits(self):
         return None            # -> le catalogue de secours sera utilisé
 
@@ -125,14 +134,54 @@ class BaseNeon:
     def __init__(self, url):
         from psycopg_pool import ConnectionPool
         from psycopg.rows import dict_row
-        # Neon met sa base en veille après quelques minutes d'inactivité et coupe les connexions :
-        # check_connection teste chaque connexion avant usage et la remplace si elle est morte.
-        self.pool = ConnectionPool(url, min_size=0, max_size=4, kwargs={"row_factory": dict_row,
-                                   "connect_timeout": 15}, open=True, timeout=20, max_idle=60,
-                                   check=ConnectionPool.check_connection, reconnect_timeout=60)
+        # Une connexion est gardée ouverte entre deux messages (évite ~0,5 s de poignée de main TLS).
+        # Neon coupe les connexions quand sa base se met en veille : on refait alors un essai.
+        self.pool = ConnectionPool(url, min_size=1, max_size=4, kwargs={"row_factory": dict_row,
+                                   "connect_timeout": 15, "keepalives": 1, "keepalives_idle": 30},
+                                   open=True, timeout=20, max_idle=600, reconnect_timeout=60)
 
     def connexion(self):
         return self.pool.connection()
+
+    def _avec_essai(self, fonction):
+        import psycopg
+        for essai in (1, 2):
+            try:
+                with self.pool.connection() as cx:
+                    return fonction(cx)
+            except psycopg.OperationalError:
+                if essai == 2:
+                    raise
+                log.info("Connexion Neon coupée (veille) : nouvel essai")
+                self.pool.check()
+
+    def charger_tour(self, psid, n):
+        """Conversation + rôle + historique en une seule connexion (un aller-retour réseau de moins par requête)."""
+        def f(cx):
+            r = cx.execute("SELECT psid, etat, panier, profil, handoff_jusqua FROM bot_conversations WHERE psid=%s",
+                           (psid,)).fetchone()
+            role = cx.execute("SELECT role FROM bot_utilisateurs WHERE psid=%s", (psid,)).fetchone()
+            hist = cx.execute("SELECT role, contenu FROM bot_messages WHERE psid=%s ORDER BY id DESC LIMIT %s",
+                              (psid, n)).fetchall()
+            return (dict(r) if r else _nouvelle_conversation(psid), role["role"] if role else "client",
+                    [dict(h) for h in reversed(hist)])
+        return self._avec_essai(f)
+
+    def sauvegarder_tour(self, conv, messages):
+        """Messages du tour + état de la conversation, dans une seule transaction."""
+        def f(cx):
+            with cx.transaction():
+                if messages:
+                    with cx.cursor() as cur:
+                        cur.executemany("INSERT INTO bot_messages (psid, role, contenu) VALUES (%s,%s,%s)",
+                                        [(conv["psid"], r, c) for r, c in messages])
+                cx.execute("""INSERT INTO bot_conversations (psid, etat, panier, profil, handoff_jusqua, maj)
+                              VALUES (%s,%s,%s,%s,%s,now())
+                              ON CONFLICT (psid) DO UPDATE SET etat=EXCLUDED.etat, panier=EXCLUDED.panier,
+                              profil=EXCLUDED.profil, handoff_jusqua=EXCLUDED.handoff_jusqua, maj=now()""",
+                           (conv["psid"], conv["etat"], json.dumps(conv["panier"], ensure_ascii=False),
+                            json.dumps(conv["profil"], ensure_ascii=False, default=str), conv.get("handoff_jusqua")))
+        return self._avec_essai(f)
 
     def initialiser(self):
         with self.connexion() as cx:
@@ -165,11 +214,13 @@ class BaseNeon:
         return [dict(r) for r in reversed(rows)]
 
     def marquer_traite(self, mid) -> bool:
-        with self.connexion() as cx:
+        def f(cx):
             r = cx.execute("INSERT INTO bot_messages_traites (mid) VALUES (%s) ON CONFLICT DO NOTHING RETURNING mid",
                            (mid,)).fetchone()
-            cx.execute("DELETE FROM bot_messages_traites WHERE cree_le < now() - interval '3 days'")
-        return r is not None
+            if hash(mid) % 50 == 0:                                   # nettoyage de temps en temps seulement
+                cx.execute("DELETE FROM bot_messages_traites WHERE cree_le < now() - interval '3 days'")
+            return r is not None
+        return self._avec_essai(f)
 
     def role(self, psid):
         with self.connexion() as cx:
@@ -200,12 +251,14 @@ class BaseNeon:
 
     def produits(self):
         """Catalogue public publié par la synchronisation du PC (table stock_produits)."""
-        with self.connexion() as cx:
-            rows = cx.execute("""SELECT code, designation, categorie, marque, prix_vente::float AS prix_vente,
-                                 stock::float AS stock, seuil::float AS seuil, statut,
-                                 coalesce(description,'') AS description, coalesce(usages,'') AS usages,
-                                 coalesce(photo_url,'') AS photo_url, prix_min::float AS prix_min
-                                 FROM stock_produits ORDER BY code""").fetchall()
+        return self._avec_essai(self._produits)
+
+    def _produits(self, cx):
+        rows = cx.execute("""SELECT code, designation, categorie, marque, prix_vente::float AS prix_vente,
+                             stock::float AS stock, seuil::float AS seuil, statut,
+                             coalesce(description,'') AS description, coalesce(usages,'') AS usages,
+                             coalesce(photo_url,'') AS photo_url, prix_min::float AS prix_min
+                             FROM stock_produits ORDER BY code""").fetchall()
         return [dict(r) for r in rows]
 
     def derniere_synchro(self):

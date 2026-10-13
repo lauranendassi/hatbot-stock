@@ -17,7 +17,7 @@ import db
 
 log = logging.getLogger("bot.catalogue")
 _cache = {"t": 0.0, "produits": [], "source": ""}
-DUREE_CACHE = 60
+DUREE_CACHE = 180          # le catalogue ne change qu'à chaque synchro du PC (5 min)
 
 
 def sans_accents(s) -> str:
