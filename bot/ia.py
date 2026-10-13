@@ -14,6 +14,7 @@ import config
 log = logging.getLogger("bot.ia")
 _session = requests.Session()
 _pause_jusqua: dict[str, float] = {}       # modèle -> heure de fin de pause (limite de débit atteinte)
+DERNIERE_ERREUR: str | None = None
 
 
 def _appel(modele: str, systeme: str, messages: list[dict], max_tokens: int, avec_effort: bool) -> str | None:
@@ -46,7 +47,9 @@ def nettoyer(texte: str) -> str:
 
 
 def generer(systeme: str, messages: list[dict], max_tokens: int = 700) -> str | None:
+    global DERNIERE_ERREUR
     if not config.GROQ_API_KEY:
+        DERNIERE_ERREUR = "GROQ_API_KEY absente"
         log.warning("GROQ_API_KEY absente : réponses préparées uniquement")
         return None
     for modele in (config.MODELE_PRINCIPAL, config.MODELE_SECOURS):
@@ -57,8 +60,10 @@ def generer(systeme: str, messages: list[dict], max_tokens: int = 700) -> str | 
             texte = _appel(modele, systeme, messages, max_tokens, avec_effort=True)
             if texte:
                 log.info("IA %s : %.1fs", modele, time.perf_counter() - debut)
+                DERNIERE_ERREUR = None
                 return texte
             log.warning("IA %s : réponse vide", modele)
         except (requests.RequestException, RuntimeError, KeyError, ValueError) as e:
             log.warning("IA %s en échec : %s", modele, e)
+            DERNIERE_ERREUR = f"{modele} : {e}"[:300]
     return None

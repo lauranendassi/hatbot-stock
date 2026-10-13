@@ -60,7 +60,10 @@ def traiter_evenement(ev: dict):
 
     # Écho d'un message envoyé par la Page : s'il ne vient pas du bot, un conseiller a pris la main
     if message.get("is_echo"):
-        if message.get("metadata") != messenger.METADATA_BOT and message.get("text"):
+        if messenger.est_echo_du_bot(message):
+            return
+        log.info("Écho d'un message non envoyé par le bot (app_id=%s) : un conseiller a écrit", message.get("app_id"))
+        if message.get("text"):
             client = ev.get("recipient", {}).get("id")
             if client:
                 with verrou(client):
@@ -134,7 +137,12 @@ def webhook():
 @app.get("/sante")
 def sante():
     base = db.base()
-    return jsonify({"statut": "ok", "heure": dt.datetime.now().isoformat(timespec="seconds"),
+    test_ia = None
+    if request.args.get("test_ia") == "1":                     # /sante?test_ia=1 : vrai appel à Groq
+        import ia
+        rep = ia.generer("Réponds uniquement : OK", [{"role": "user", "content": "test"}], max_tokens=50)
+        test_ia = {"ok": bool(rep), "reponse": rep, "erreur": ia.DERNIERE_ERREUR}
+    return jsonify({"test_ia": test_ia,"statut": "ok", "heure": dt.datetime.now().isoformat(timespec="seconds"),
                     "catalogue": {"produits": len(catalogue.produits()), "source": catalogue.source()},
                     "derniere_synchro_excel": getattr(base, "derniere_synchro", lambda: None)(),
                     "base": "neon" if config.DATABASE_URL else "memoire",

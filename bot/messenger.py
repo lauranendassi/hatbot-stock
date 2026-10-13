@@ -16,6 +16,26 @@ log = logging.getLogger("bot.messenger")
 _session = requests.Session()
 METADATA_BOT = "weloobe-bot"     # permet de distinguer nos messages de ceux d'un conseiller humain (échos)
 
+# Messages envoyés récemment par le bot : un « écho » qui correspond à l'un d'eux vient du bot,
+# pas d'un conseiller humain (Meta ne renvoie pas toujours la metadata dans l'écho).
+from collections import deque
+import threading
+_recents_mids: deque = deque(maxlen=500)
+_recents_textes: deque = deque(maxlen=500)
+_verrou_recents = threading.Lock()
+
+
+def est_echo_du_bot(message: dict) -> bool:
+    if message.get("metadata") == METADATA_BOT:
+        return True
+    if config.APP_ID and str(message.get("app_id", "")) == config.APP_ID:
+        return True
+    with _verrou_recents:
+        if message.get("mid") in _recents_mids:
+            return True
+        texte = (message.get("text") or "").strip()
+        return bool(texte) and texte in _recents_textes
+
 
 def _url():
     return f"https://graph.facebook.com/{config.GRAPH_VERSION}/me/messages"
@@ -64,6 +84,10 @@ def decouper(texte: str, maxi: int = config.LONGUEUR_MAX_MESSAGE) -> list[str]:
 
 def _envoyer(psid: str, charge: dict) -> bool:
     corps = {"recipient": {"id": psid}, "messaging_type": "RESPONSE", **charge}
+    texte = (charge.get("message") or {}).get("text")
+    if texte:
+        with _verrou_recents:
+            _recents_textes.append(texte.strip())
     if config.MESSENGER_DRY_RUN or not config.PAGE_ACCESS_TOKEN:
         log.info("[SIMULATION Messenger → %s] %s", psid[-6:], str(charge)[:500])
         return True
@@ -72,6 +96,10 @@ def _envoyer(psid: str, charge: dict) -> bool:
         if r.status_code != 200:
             log.error("Messenger %s : %s", r.status_code, r.text[:300])
             return False
+        mid = (r.json() or {}).get("message_id")
+        if mid:
+            with _verrou_recents:
+                _recents_mids.append(mid)
         return True
     except requests.RequestException as e:
         log.error("Messenger injoignable : %s", e)

@@ -38,6 +38,7 @@ DATABASE_URL = env("DATABASE_URL")
 PAGE_ACCESS_TOKEN = env("PAGE_ACCESS_TOKEN")
 VERIFY_TOKEN = env("VERIFY_TOKEN", "weloobe_verify")
 APP_SECRET = env("APP_SECRET")                       # vérifie la signature des appels Meta
+APP_ID = env("APP_ID")                               # facultatif : identifiant de l'app Meta (Paramètres > Général)
 GRAPH_VERSION = env("GRAPH_VERSION", "v26.0")
 MESSENGER_DRY_RUN = env("MESSENGER_DRY_RUN", "0") == "1"   # 1 = n'envoie rien, écrit dans les logs
 LONGUEUR_MAX_MESSAGE = 1900
