@@ -1,13 +1,17 @@
+# Environnements et caches
 venv/
 __pycache__/
+.pytest_cache/
+
+# Données et fichiers personnels : JAMAIS sur GitHub (prix d'achat, mots de passe, clés)
 *.xlsx
+*.xls
+config.ini
+.env
 data/
 logs/
 _sauvegardes/
-config.ini
 
-.env
-bot/.env
-bot/venv/
+# Anciennes versions du prototype
 version 1/
 *.bas

@@ -17,7 +17,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from common import (F_CATALOGUE, F_PARAMS, F_PRODUITS_ACHATS, F_SAISIE_ACHATS, F_SAISIE_VENTES,
+from common import (F_LISTES, normaliser, F_CATALOGUE, F_PARAMS, F_PRODUITS_ACHATS, F_SAISIE_ACHATS, F_SAISIE_VENTES,
                     JOURS_FR, LIGNE_DEBUT_CATALOGUE, LIGNE_DEBUT_SAISIE, MOIS_FR, Achat, Anomalie,
                     Config, EtatStock, Produit, Vente)
 
@@ -137,7 +137,7 @@ def ecrire_catalogue_vendeur(wb, cfg: Config, produits: list[Produit], etats: di
         cellule(ws, r, 5, p.prix_vente, FMT_FCFA)
         cellule(ws, r, 6, p.stock_initial, FMT_NB)
         cellule(ws, r, 7, e.entrees, FMT_NB)
-        cellule(ws, r, 8, f"=SUMIF({F_SAISIE_VENTES}!$C${LIGNE_DEBUT_SAISIE}:$C${fin_saisie},$A{r},"
+        cellule(ws, r, 8, f"=SUMIF({F_SAISIE_VENTES}!$D${LIGNE_DEBUT_SAISIE}:$D${fin_saisie},$A{r},"
                           f"{F_SAISIE_VENTES}!$E${LIGNE_DEBUT_SAISIE}:$E${fin_saisie})", FMT_NB)
         cellule(ws, r, 9, f"=F{r}+G{r}-H{r}", FMT_NB, gras=True, align="center")
         cellule(ws, r, 10, p.seuil, FMT_NB)
@@ -160,32 +160,60 @@ def ecrire_catalogue_vendeur(wb, cfg: Config, produits: list[Produit], etats: di
     wp.sheet_state = "hidden"
     proteger(wp, cfg.mdp_feuilles)
 
+    # Liste triée des désignations pour la liste déroulante « filtrante » de la saisie
+    if F_LISTES in wb.sheetnames:
+        wl = wb[F_LISTES]
+        wl.delete_rows(1, wl.max_row + 1)
+    else:
+        wl = wb.create_sheet(F_LISTES)
+    wl["A1"], wl["B1"] = "Désignation (triée)", "Code"
+    tries = sorted(produits, key=lambda p: normaliser(p.designation))
+    for i, p in enumerate(tries, start=2):
+        wl.cell(row=i, column=1, value=p.designation)
+        wl.cell(row=i, column=2, value=p.code)
+    wl.column_dimensions["A"].width = 70
+    wl.sheet_state = "hidden"
+    proteger(wl, cfg.mdp_feuilles)
+    n_des = max(len(tries), 1) + 1
+    definir_nom(wb, "Liste_Des", f"{F_LISTES}!$A$2:$A${n_des}")
+    definir_nom(wb, "Liste_Des_Codes", f"{F_LISTES}!$B$2:$B${n_des}")
+    definir_nom(wb, "Liste_Des_Debut", f"{F_LISTES}!$A$2")
+
     definir_nom(wb, "Cat_Codes", f"{F_CATALOGUE}!$A${LIGNE_DEBUT_CATALOGUE}:$A${derniere}")
     definir_nom(wb, "Cat_Table", f"{F_CATALOGUE}!$A${LIGNE_DEBUT_CATALOGUE}:$K${derniere}")
     definir_nom(wb, "Liste_Vendeurs", f"{F_PARAMS}!$A$2:$A${len(cfg.vendeurs) + 1}")
+
+
+# Liste déroulante « filtrante » (Excel 2016, sans macro) : si la cellule contient le début d'un nom,
+# la liste ne montre que les produits qui commencent par ce texte ; vide = tous les produits.
+FORMULE_LISTE_FILTREE = ('OFFSET(Liste_Des_Debut,IF(COUNTIF(Liste_Des,$C{r}&"*")=0,0,MATCH($C{r}&"*",Liste_Des,0)-1),0,'
+                         'IF(COUNTIF(Liste_Des,$C{r}&"*")=0,ROWS(Liste_Des),COUNTIF(Liste_Des,$C{r}&"*")),1)')
 
 
 def creer_saisie_ventes(wb, cfg: Config):
     ws = wb.create_sheet(F_SAISIE_VENTES)
     fin_saisie = LIGNE_DEBUT_SAISIE + cfg.lignes_ventes - 1
     titre(ws, "A1", "Saisie des ventes",
-          "Remplissez uniquement les cellules jaunes : Date, Code, Quantité, (Prix pratiqué), Vendeur, Client. "
-          "Le reste se calcule tout seul. Enregistrez (Ctrl+S) après chaque vente.")
-    entetes(ws, 4, ["N°", "Date", "Code produit", "Désignation", "Quantité", "Prix catalogue",
+          "Cellules jaunes : Date, Produit (liste déroulante), Quantité, Prix pratiqué si remise, Vendeur, Client. "
+          "Le code SKU et les prix se remplissent seuls. Recherche : tapez le début du nom, Entrée, puis ouvrez la liste.")
+    entetes(ws, 4, ["N°", "Date", "Produit (choisir dans la liste)", "Code SKU (auto)", "Quantité", "Prix catalogue",
                     "Prix pratiqué (si remise)", "Total", "Vendeur", "Client (facultatif)", "Contrôle"])
-    largeurs(ws, [6, 12, 14, 38, 9, 15, 15, 16, 14, 22, 17])
+    largeurs(ws, [6, 12, 58, 13, 9, 15, 15, 16, 14, 22, 17])
     ws.freeze_panes = "B5"
 
     jaune = PatternFill("solid", fgColor=JAUNE_SAISIE)
+    gris = PatternFill("solid", fgColor=GRIS)
     ouvert = Protection(locked=False)
     for r in range(LIGNE_DEBUT_SAISIE, fin_saisie + 1):
         ws.cell(row=r, column=1, value=f'=IF(C{r}="","",ROW()-{LIGNE_DEBUT_SAISIE - 1})')
-        ws.cell(row=r, column=4, value=f'=IF(C{r}="","",IFERROR(VLOOKUP(C{r},Cat_Table,2,FALSE),"Code inconnu"))')
-        ws.cell(row=r, column=6, value=f'=IF(C{r}="","",IFERROR(VLOOKUP(C{r},Cat_Table,5,FALSE),""))').number_format = FMT_FCFA
-        ws.cell(row=r, column=8, value=f'=IF(OR(C{r}="",E{r}=""),"",E{r}*IF(G{r}<>"",G{r},N(F{r})))').number_format = FMT_FCFA
+        x = ws.cell(row=r, column=4, value=f'=IF(C{r}="","",IFERROR(INDEX(Liste_Des_Codes,MATCH(C{r},Liste_Des,0)),"?"))')
+        x.fill = gris
+        x.font = Font(bold=True, color=BLEU)
+        ws.cell(row=r, column=6, value=f'=IF(OR(D{r}="",D{r}="?"),"",IFERROR(VLOOKUP(D{r},Cat_Table,5,FALSE),""))').number_format = FMT_FCFA
+        ws.cell(row=r, column=8, value=f'=IF(OR(F{r}="",E{r}=""),"",E{r}*IF(G{r}<>"",G{r},N(F{r})))').number_format = FMT_FCFA
         ws.cell(row=r, column=11, value=(
-            f'=IF(C{r}="","",IF(ISNA(MATCH(C{r},Cat_Codes,0)),"Code inconnu",IF(B{r}="","Date manquante",'
-            f'IF(I{r}="","Vendeur manquant",IF(VLOOKUP(C{r},Cat_Table,9,FALSE)<0,"Stock insuffisant","OK")))))'))
+            f'=IF(C{r}="","",IF(D{r}="?","Choisir dans la liste",IF(B{r}="","Date manquante",IF(E{r}="","Quantité manquante",'
+            f'IF(I{r}="","Vendeur manquant",IF(VLOOKUP(D{r},Cat_Table,9,FALSE)<0,"Stock insuffisant","OK"))))))'))
         for c in (2, 3, 5, 7, 9, 10):
             x = ws.cell(row=r, column=c)
             x.fill = jaune
@@ -194,8 +222,12 @@ def creer_saisie_ventes(wb, cfg: Config):
         ws.cell(row=r, column=7).number_format = FMT_FCFA
 
     plage = lambda col: f"{col}{LIGNE_DEBUT_SAISIE}:{col}{fin_saisie}"
-    dv_code = DataValidation(type="list", formula1="Cat_Codes", allow_blank=True, showErrorMessage=True,
-                             errorTitle="Code inconnu", error="Choisissez un code dans la liste (feuille Catalogue).")
+    # Pas de message d'erreur bloquant sur le produit : il faut pouvoir taper le début du nom pour filtrer.
+    # La colonne Contrôle signale « Choisir dans la liste » tant qu'un vrai produit n'est pas choisi.
+    dv_prod = DataValidation(type="list", formula1=FORMULE_LISTE_FILTREE.format(r=LIGNE_DEBUT_SAISIE),
+                             allow_blank=True, showErrorMessage=False, showInputMessage=True,
+                             promptTitle="Produit",
+                             prompt="Ouvrez la liste, ou tapez le début du nom (ex. Dell), Entrée, puis rouvrez la liste.")
     dv_vend = DataValidation(type="list", formula1="Liste_Vendeurs", allow_blank=True, showErrorMessage=True,
                              errorTitle="Vendeur", error="Choisissez votre nom dans la liste.")
     dv_date = DataValidation(type="date", operator="between", formula1="DATE(2020,1,1)", formula2="DATE(2035,12,31)",
@@ -205,7 +237,7 @@ def creer_saisie_ventes(wb, cfg: Config):
                             showErrorMessage=True, errorTitle="Quantité", error="La quantité doit être un nombre entier positif.")
     dv_prix = DataValidation(type="decimal", operator="greaterThanOrEqual", formula1="0", allow_blank=True,
                              showErrorMessage=True, errorTitle="Prix", error="Montant en FCFA, sans texte.")
-    for dv, col in ((dv_code, "C"), (dv_vend, "I"), (dv_date, "B"), (dv_qte, "E"), (dv_prix, "G")):
+    for dv, col in ((dv_prod, "C"), (dv_vend, "I"), (dv_date, "B"), (dv_qte, "E"), (dv_prix, "G")):
         ws.add_data_validation(dv)
         dv.add(plage(col))
 
@@ -213,6 +245,8 @@ def creer_saisie_ventes(wb, cfg: Config):
                                   fill=PatternFill("solid", fgColor=VERT), font=Font(color="006100")))
     ws.conditional_formatting.add(plage("K"), FormulaRule(formula=[f'AND(K{LIGNE_DEBUT_SAISIE}<>"",K{LIGNE_DEBUT_SAISIE}<>"OK")'],
                                   fill=PatternFill("solid", fgColor=ROUGE), font=Font(color="9C0006", bold=True)))
+    ws.conditional_formatting.add(plage("C"), FormulaRule(formula=[f'$D{LIGNE_DEBUT_SAISIE}="?"'],
+                                  fill=PatternFill("solid", fgColor=ORANGE)))
     proteger(ws, cfg.mdp_feuilles)
     return ws
 
@@ -238,7 +272,9 @@ def creer_fichier_vendeur(cfg, produits, etats, maj):
     creer_mode_emploi(wb, "Mode d'emploi — vendeurs", [
         "1. Après chaque vente, allez dans la feuille « Saisie_ventes », sur la première ligne vide.",
         "2. Date : tapez Ctrl + ; (point-virgule) pour la date du jour.",
-        "3. Code produit : choisissez dans la liste déroulante. La désignation et le prix s'affichent seuls.",
+        "3. Produit : cliquez la flèche et choisissez le produit. Pour chercher : tapez le début du nom "
+        "(ex. « Dell » ou « Écran »), appuyez sur Entrée, puis rouvrez la flèche : seuls les produits qui "
+        "commencent ainsi s'affichent. Le code SKU et le prix se remplissent seuls.",
         "4. Quantité : nombre d'articles vendus.",
         "5. Prix pratiqué : seulement si vous avez accordé une remise. Sinon laissez vide.",
         "6. Vendeur : choisissez votre nom. Client : facultatif (nom ou téléphone).",

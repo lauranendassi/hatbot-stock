@@ -1,5 +1,5 @@
 {
- "mis_a_jour": "13/10/2026 à 14:08",
+ "mis_a_jour": "14/10/2026 à 10:16",
  "produits": [
   {
    "code": "LAP-001",
@@ -59,9 +59,9 @@
    "categorie": "PC portable",
    "marque": "Lenovo",
    "prix_vente": 335000.0,
-   "stock": 4.0,
+   "stock": 0.0,
    "seuil": 1.0,
-   "statut": "Disponible",
+   "statut": "Rupture",
    "description": "Réputé pour sa solidité et son clavier",
    "usages": "développement, gestion, robustesse, entreprise",
    "photo_url": ""

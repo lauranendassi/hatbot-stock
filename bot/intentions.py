@@ -25,7 +25,11 @@ MOTIFS: list[tuple[str, str]] = [
     ("ANNULER", r"\bannul|laisse tomber|\boublie[zr]?\b|\bplus besoin\b|je ne veux plus|finalement non|"
                 r"je change d'?avis|^stop\b"),
     ("PHOTO", r"\bphotos?\b|\bimages?\b|\bvoir (le|la|les|l'|a quoi)|montre[rz]?[- ]?(moi)?\b|a quoi (il|elle|ca) ressemble"),
-    ("NEGOCIATION", r"laisse[rz]?[- ](moi|nous)?|laisse[- ]le|\bdernier prix\b|\bfai(re|tes|s|t) un (petit )?(effort|geste)|\bfai(s|tes)[- ]moi (un|une|le|la)\b|\b(me|nous) (le |la )?fai(re|tes|s) (a |au )?\d|\ba \d+ ?(k|mille|000)? ?(c'?est bon|ok)\b|"
+    ("NEGOCIATION", r"\bfaire mieux\b|\bmieux que (ca|cela)\b|\bje (peux|vais) (payer|donner|mettre|monter)\b|"
+                    r"\bc'?est cher\b|\bun peu cher\b|\bpas moyen\b|s'?arranger|\barrange[rz]?\b|\bprix d'?ami\b|"
+                    r"\b(tu|vous) (peux|pouvez) (faire|me faire|descendre|baisser)\b|\bon peut discuter\b|"
+                    r"\bdiscut(er|ons) (le|du) prix\b|\bderniere? offre\b|"
+                    r"laisse[rz]?[- ](moi|nous)?|laisse[- ]le|\bdernier prix\b|\bfai(re|tes|s|t) un (petit )?(effort|geste)|\bfai(s|tes)[- ]moi (un|une|le|la)\b|\b(me|nous) (le |la )?fai(re|tes|s) (a |au )?\d|\ba \d+ ?(k|mille|000)? ?(c'?est bon|ok)\b|"
                     r"\bremise\b|\breduction\b|\bnegoci|\brabais\b|\bdiscount\b|moins cher pour moi|"
                     r"\bbaisse[rz]?\b|\bdiminue[rz]?\b|\b\d+\s*(k|mille|000)?\s*ca (passe|va)\b|\bca passe a\b|\bje propose\b|\bje vous propose\b|"
                     r"\bmon prix\b|\bdernier mot\b|\bc'?est trop cher\b|\btrop cher\b|\bje paye?\b \d|"
@@ -127,7 +131,8 @@ def analyser(texte: str, attend_budget: bool = False, attend_quantite: bool = Fa
         if len(vals) >= 2 and "entre" in t:
             a.budget_min = min(vals)
     if "NEGOCIATION" in trouvees or "PRIX" in trouvees:
-        offres = montants(texte_sans_tel, True)
+        # un prix proposé fait au moins 10 000 FCFA : « 5420 » dans « latitude 5420 » n'est pas une offre
+        offres = [o for o in montants(texte_sans_tel, True) if o >= 10000]
         if offres:
             a.offre = max(offres) if len(offres) == 1 else min(offres)
     if re.search(r"pas (trop )?cher|petit budget|moins cher|economique|budget (serre|limite|reduit)", t):

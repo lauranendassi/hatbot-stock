@@ -1,0 +1,198 @@
+<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Guide — Stock et chatbot WeloobeAI</title>
+<style>
+body{font:16px/1.6 "Segoe UI",Arial,sans-serif;color:#1b2333;background:#f6f7fb;margin:0}
+main{max-width:900px;margin:0 auto;padding:24px 20px 60px;background:#fff;min-height:100vh}
+h1{color:#1f3864;font-size:28px;border-bottom:3px solid #1f3864;padding-bottom:8px}
+h2{color:#1f3864;margin-top:36px;font-size:21px} h3{color:#2e5597;font-size:17px;margin-top:22px}
+table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+th{background:#1f3864;color:#fff;text-align:left;padding:8px} td{border:1px solid #d9dee8;padding:8px;vertical-align:top}
+tr:nth-child(even) td{background:#f4f6fa} code{background:#eef1f7;padding:1px 5px;border-radius:4px;font-size:14px}
+pre{background:#1f2633;color:#e8ecf3;padding:14px;border-radius:8px;overflow-x:auto;font-size:13px;line-height:1.4}
+pre code{background:none;padding:0;color:inherit} strong{color:#14223d}
+</style></head><body><main><h1>Système de stock et chatbot WeloobeAI — Guide complet</h1>
+<h2>1. Le principe en une phrase</h2>
+<p>Les vendeurs et l'admin <strong>saisissent</strong> dans 3 fichiers Excel ; un petit programme invisible sur le PC <strong>met à jour tout le reste</strong> une dizaine de secondes après chaque enregistrement (fichiers de suivi, tableau de bord chiffré, base Neon) ; le <strong>chatbot Messenger</strong> lit Neon et répond aux clients avec les stocks et les prix réels.</p>
+<pre><code> SAISIE (humains)                       MISE À JOUR AUTO (PC)          CONSULTATION
+ ───────────────                        ─────────────────────          ────────────
+ Gestion_stock_corrige.xlsx  ─┐                                   ┌─► Ventes_2026_Mois.xlsx
+ Stocks_vendeur.xlsx         ─┼─► Ctrl+S ─► surveiller.py ─► sync ┼─► Stocks_admin.xlsx 🔒
+ Achats_2026.xlsx            ─┘            (~10 secondes)         └─► Neon (base en ligne)
+                                                                          │
+                                       Clients Messenger ◄── chatbot (Render) ◄┘
+</code></pre>
+<p>Règle d'or : <strong>chaque fichier a un seul « auteur »</strong>. Les humains écrivent dans les fichiers de saisie ; le programme écrit dans les fichiers de consultation. Ne tapez jamais rien dans <code>Ventes_2026_Mois.xlsx</code> ni dans <code>Stocks_admin.xlsx</code> : ils sont régénérés automatiquement et vos modifications seraient effacées.</p>
+<h2>2. Les fichiers</h2>
+<table>
+<thead>
+<tr>
+<th>Fichier</th>
+<th>Qui l'utilise</th>
+<th>Rôle</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Gestion_stock_corrige.xlsx</code></td>
+<td>Admin</td>
+<td><strong>Référentiel produits</strong> : code, désignation, catégorie, marque, prix d'achat, prix de vente, stock initial, seuil d'alerte, usages, description, photo, prix minimum de négociation. Toute modification de prix ou nouveau produit se fait ici.</td>
+</tr>
+<tr>
+<td><code>Stocks_vendeur.xlsx</code></td>
+<td>Les 6 vendeurs</td>
+<td>Feuille <strong>Saisie_ventes</strong> (une ligne par vente) et feuille <strong>Catalogue</strong> (prix de vente et stock disponible en temps réel). Aucun prix d'achat visible.</td>
+</tr>
+<tr>
+<td><code>Achats_2026.xlsx</code></td>
+<td>Admin</td>
+<td>Saisie des <strong>arrivages</strong> (date, code, quantité, prix d'achat, fournisseur, facture).</td>
+</tr>
+<tr>
+<td><code>Ventes_2026_Mois.xlsx</code></td>
+<td>Admin, direction</td>
+<td><strong>Généré</strong> : une feuille par mois + récapitulatif par produit et par vendeur.</td>
+</tr>
+<tr>
+<td><code>Stocks_admin.xlsx</code> 🔒</td>
+<td>Direction</td>
+<td><strong>Généré et chiffré</strong> (mot de passe <code>weloobe_admin</code>) : tableau de bord, calendrier des ventes, stock valorisé, marges, journal des ventes et achats, performance des vendeurs, alertes.</td>
+</tr>
+</tbody>
+</table>
+<p>Dossiers et fichiers techniques :</p>
+<table>
+<thead>
+<tr>
+<th>Élément</th>
+<th>Rôle</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>config.ini</code></td>
+<td>Réglages : année, noms des vendeurs, mots de passe, connexion Neon, marge de négociation du bot.</td>
+</tr>
+<tr>
+<td><code>connaissances\magasin.md</code></td>
+<td>Ce que le bot répond sur l'adresse, les horaires, le paiement, la garantie, la livraison. Remplacez les <code>[crochets]</code>.</td>
+</tr>
+<tr>
+<td><code>scripts\</code></td>
+<td>Le programme de mise à jour (Python).</td>
+</tr>
+<tr>
+<td><code>bot\</code></td>
+<td>Le chatbot Messenger (déployé sur Render via GitHub). Guide détaillé : <code>bot\GUIDE_BOT.md</code>.</td>
+</tr>
+<tr>
+<td><code>modeles\</code></td>
+<td>Modèles utilisés <strong>seulement</strong> si <code>config.ini</code> ou <code>Gestion_stock_corrige.xlsx</code> n'existent pas encore.</td>
+</tr>
+<tr>
+<td><code>logs\sync.log</code></td>
+<td>Journal : chaque mise à jour, chaque fichier reporté, chaque erreur.</td>
+</tr>
+<tr>
+<td><code>_sauvegardes\</code></td>
+<td>Copies automatiques avant toute recréation de fichier.</td>
+</tr>
+</tbody>
+</table>
+<h2>3. Installation (une seule fois, ou après une mise à jour du dossier)</h2>
+<ol>
+<li>Fermez Excel.</li>
+<li>Placez le dossier dans <code>C:\Users\DM-TECH\Desktop\Projet_Stock\</code>.
+   <em>Si vous mettez à jour un dossier existant</em> : copiez le nouveau contenu <strong>par-dessus</strong> l'ancien. Vos fichiers Excel, <code>config.ini</code>, <code>venv</code> et <code>bot\.env</code> ne sont pas dans le ZIP : ils restent intacts.</li>
+<li><em>Première installation seulement</em> : ouvrez <code>config.ini</code> (Bloc-notes), collez la chaîne Neon après <code>database_url =</code> et mettez les vrais prénoms des vendeurs après <code>noms =</code>. (Si <code>config.ini</code> n'existe pas encore, <code>installer.bat</code> le crée à l'étape 4 : complétez-le puis relancez <code>installer.bat</code>.)</li>
+<li>Double-cliquez sur <strong><code>installer.bat</code></strong>. Il :</li>
+<li>prépare Python et ses bibliothèques ;</li>
+<li>crée les fichiers Excel manquants, et <strong>convertit</strong> un ancien fichier vendeur au nouveau format en <strong>reprenant les ventes déjà saisies</strong> ;</li>
+<li>fait une première mise à jour (fichiers + Neon) ;</li>
+<li>active la <strong>mise à jour automatique</strong> (au démarrage de Windows, sans droits administrateur).</li>
+<li>Vérifiez la fin de la fenêtre : <code>✔ Neon : 15 produits…</code> puis <code>Mise a jour automatique ACTIVE</code>.</li>
+</ol>
+<h2>4. Au quotidien</h2>
+<h3>Vendeur — enregistrer une vente</h3>
+<ol>
+<li><code>Stocks_vendeur.xlsx</code> → feuille <strong>Saisie_ventes</strong> → première ligne vide.</li>
+<li><strong>Date</strong> : <code>Ctrl + ;</code> (date du jour).</li>
+<li><strong>Produit</strong> : flèche de la liste déroulante. Pour chercher : tapez le début du nom (<code>Dell</code>, <code>HP</code>, <code>Écran</code>…), <strong>Entrée</strong>, puis rouvrez la flèche : seuls les produits qui commencent ainsi apparaissent.
+   → le <strong>code SKU</strong>, le <strong>prix</strong> et le <strong>total</strong> se remplissent tout seuls.</li>
+<li><strong>Quantité</strong>, <strong>Prix pratiqué</strong> (seulement en cas de remise), <strong>Vendeur</strong>, <strong>Client</strong> (facultatif).</li>
+<li>La colonne <strong>Contrôle</strong> doit afficher <strong>OK</strong> (sinon elle dit quoi corriger).</li>
+<li><strong>Ctrl + S</strong>. C'est tout : environ 10 secondes plus tard, les ventes du mois, le tableau de bord et le stock du bot sont à jour.</li>
+</ol>
+<p>Ne supprimez jamais une ligne : en cas d'erreur, corrigez-la (ou mettez la quantité à 0).</p>
+<h3>Admin — arrivage de marchandise</h3>
+<p><code>Achats_2026.xlsx</code> → une ligne par arrivage → Ctrl + S. Le stock remonte partout automatiquement.</p>
+<h3>Admin — nouveau produit ou changement de prix</h3>
+<p>Uniquement dans <code>Gestion_stock_corrige.xlsx</code> → Ctrl + S. La liste déroulante des vendeurs, le catalogue et le bot se mettent à jour. (Le prix d'une vente déjà saisie ne change pas.)</p>
+<h3>Direction — consulter</h3>
+<p>Ouvrez <code>Stocks_admin.xlsx</code> (mot de passe). Un fichier <strong>ouvert</strong> ne peut pas être modifié par le programme : pour voir les dernières ventes, <strong>fermez-le puis rouvrez-le</strong> une quinzaine de secondes plus tard. Chaque soir, regardez la feuille <strong>Alertes</strong> (ruptures, stocks faibles, saisies incomplètes).</p>
+<h2>5. Le chatbot Messenger</h2>
+<p>Il répond aux clients sur la page Facebook, 24 h/24, en s'appuyant sur les stocks et prix réels (copiés dans Neon à chaque mise à jour).</p>
+<ul>
+<li><strong>Il comprend d'abord le besoin</strong> (usage, puis budget) avant de proposer un produit et d'en donner le prix — le code l'empêche de donner un prix trop tôt. Si le client insiste, il le donne.</li>
+<li><strong>Il conseille 1 ou 2 produits</strong> adaptés, avec des arguments liés à l'usage du client ; jamais le catalogue complet.</li>
+<li><strong>Il négocie</strong> en 3 paliers (petit geste, plus grand geste, dernier prix) sans jamais descendre sous le <strong>prix minimum</strong> : colonne <code>Prix minimum (FCFA)</code> du fichier produits, ou à défaut prix de vente − 7 % sans passer sous prix d'achat + 15 % (réglable dans <code>config.ini</code>, section <code>[negociation]</code>). C'est le code qui décide du prix, pas l'IA.</li>
+<li><strong>Il prend les réservations</strong> (nom, téléphone camerounais vérifié, retrait ou livraison) et prévient l'équipe par email, Martial en copie.</li>
+<li><strong>Il passe la main</strong> à un humain si le client le demande, est mécontent ou a une panne (SAV) ; il se tait ensuite 12 h sur cette conversation, et aussi dès qu'un conseiller répond lui-même depuis la page.</li>
+<li><strong>Équipe</strong> : dans Messenger, <code>/connexion CODE</code> donne accès aux commandes <code>/stock</code>, <code>/commandes</code>, et aux questions sur les ventes (« combien on a vendu hier ? ») selon le rôle (vendeur, admin, boss).</li>
+<li>Son comportement se règle dans <code>bot\instructions.md</code>, sans toucher au code.</li>
+</ul>
+<p>Mise à jour du bot : modifiez les fichiers du dossier <code>bot\</code>, puis dans Git Bash :</p>
+<pre><code>cd ~/Desktop/Projet_Stock
+git add -A
+git commit -m &quot;description de la modification&quot;
+git push origin main
+</code></pre>
+<p>Render redéploie tout seul en 1 à 2 minutes. Santé du bot : <code>https://hatbot-stock.onrender.com/sante</code>.</p>
+<h2>6. En cas de problème</h2>
+<table>
+<thead>
+<tr>
+<th>Symptôme</th>
+<th>Solution</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Le tableau de bord n'affiche pas une vente</td>
+<td>Le fichier vendeur a-t-il été enregistré (Ctrl+S) ? <code>Stocks_admin.xlsx</code> était-il ouvert ? Fermez-le, attendez 15 s, rouvrez-le.</td>
+</tr>
+<tr>
+<td>Rien ne se met à jour</td>
+<td>Double-cliquez <code>sync_stock.bat</code> (mise à jour immédiate) et lisez le message. Puis relancez <code>installer_tache.bat</code> pour réactiver l'automatique.</td>
+</tr>
+<tr>
+<td><code>⏸ … ouvert dans Excel</code> dans le journal</td>
+<td>Normal : le fichier sera mis à jour dès sa fermeture.</td>
+</tr>
+<tr>
+<td><code>✘ … n'a pas pu être mis à jour</code></td>
+<td>Copiez les lignes du journal <code>logs\sync.log</code> à votre support technique.</td>
+</tr>
+<tr>
+<td>Contrôle = « Choisir dans la liste »</td>
+<td>Le produit tapé n'est pas un nom exact : choisissez-le dans la flèche.</td>
+</tr>
+<tr>
+<td>Le bot donne un stock ancien</td>
+<td>Le PC est-il allumé et connecté à internet ? La mise à jour vers Neon reprend toute seule au retour de la connexion.</td>
+</tr>
+<tr>
+<td>Le bot ne répond plus</td>
+<td>Ouvrez <code>/sante</code> (lien ci-dessus). Si un client a demandé un conseiller, le bot se tait 12 h sur cette conversation : c'est voulu.</td>
+</tr>
+<tr>
+<td>Arrêter la mise à jour automatique</td>
+<td><code>desinstaller_tache.bat</code>, puis redémarrer le PC.</td>
+</tr>
+</tbody>
+</table>
+<h2>7. Sécurité</h2>
+<ul>
+<li><code>config.ini</code>, les fichiers Excel et <code>bot\.env</code> contiennent des mots de passe, des clés et les prix d'achat : ils ne sont <strong>jamais</strong> envoyés sur GitHub (fichier <code>.gitignore</code>) et ne doivent pas être partagés avec les vendeurs.</li>
+<li>Les vendeurs n'ont besoin que de <code>Stocks_vendeur.xlsx</code>.</li>
+<li>Le mot de passe du fichier admin se transmet de vive voix ou par SMS, jamais par email.</li>
+</ul></main></body></html>

@@ -11,7 +11,7 @@ niveau: 0
 Le magasin se trouve à [quartier, repère précis], Yaoundé. Nous sommes ouverts du lundi au samedi de [8h] à [19h]. Le dimanche, le magasin est fermé.
 
 ## Moyens de paiement acceptés
-Vous pouvez payer en espèces, par Orange Money ou par MTN Mobile Money [693275431]. Pour les entreprises, nous acceptons aussi le virement bancaire sur facture pro forma.
+Vous pouvez payer en espèces, par Orange Money ou par MTN Mobile Money [numéros marchands à préciser]. Pour les entreprises, nous acceptons aussi le virement bancaire sur facture pro forma.
 
 ## Garantie
 Les ordinateurs reconditionnés sont garantis [3 mois] pièces et main-d'œuvre. Les accessoires neufs sont garantis [6 mois] contre les défauts de fabrication. La garantie ne couvre pas la casse, l'oxydation ni les dégâts dus aux coupures de courant : nous conseillons un onduleur.
@@ -23,4 +23,4 @@ Nous livrons à Yaoundé sous [24 h] pour [1 500 FCFA] selon le quartier. Pour l
 Un produit peut être réservé [24 h] avec un acompte de [20 %]. Au-delà, il est remis en vente.
 
 ## Contact
-Téléphone / WhatsApp : [+237 676543245]. Email : [contact@weloobe.com].
+Téléphone / WhatsApp : [+237 6XX XX XX XX]. Email : [contact@...].

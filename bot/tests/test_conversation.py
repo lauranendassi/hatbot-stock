@@ -152,3 +152,26 @@ def test_photo_demandee_puis_modele(ia_factice):
     assert "quel modèle" in r[0]
     r = dire("le hp probook", "n3")
     assert "photo" in r[0] and "ProBook" in r[0]
+
+
+def test_numero_de_modele_nest_pas_une_offre(ia_factice):
+    r = dire("prix du dell latitude 5420 ?", "m1")
+    assert db.base().conversation("m1")["profil"].get("champ_attendu") == "usage"
+    assert "285 000" not in r[0]
+
+
+def test_montant_seul_apres_prix_annonce_devient_offre(ia_factice):
+    dire("le dell latitude 5420 pour mes études", "m2")
+    r = dire("et à 280 ?", "m2")
+    assert "285 000 FCFA" in r[0]
+
+
+def test_nouvelle_visite_remet_la_discussion_a_zero(ia_factice):
+    import datetime as dt
+    dire("prix du dell latitude 5420 ?", "m3")
+    dire("donnez moi juste le prix", "m3")
+    conv = db.base().conversation("m3")
+    conv["profil"]["derniere_interaction"] = (dt.datetime.now() - dt.timedelta(hours=8)).isoformat()
+    db.base().enregistrer_conversation(conv)
+    dire("bonsoir c'est combien le HP EliteBook ?", "m3")
+    assert "NE DONNES AUCUN PRIX" in ia_factice["appels"][-1]["systeme"]

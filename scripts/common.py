@@ -49,6 +49,7 @@ F_CATALOGUE = "Catalogue"
 F_SAISIE_VENTES = "Saisie_ventes"
 F_PARAMS = "Parametres"
 F_SAISIE_ACHATS = "Saisie_achats"
+F_LISTES = "Listes"
 F_PRODUITS_ACHATS = "Produits"
 
 # Géométrie des feuilles de saisie (1re ligne de données)
@@ -484,12 +485,23 @@ def lire_ventes(cfg: Config, produits: dict[str, Produit], anomalies: list[Anoma
 
     wb = ouvrir_classeur(cfg.f_vendeur, data_only=True, read_only=True)
     ws = wb[F_SAISIE_VENTES]
+    entete_c = normaliser(next(ws.iter_rows(min_row=4, max_row=4, values_only=True))[2])
+    ancien_format = entete_c.startswith("code")             # anciens fichiers : code en C, désignation en D
+    par_nom = {normaliser(p.designation): c for c, p in produits.items()}
     ventes = []
     for n, r in enumerate(ws.iter_rows(min_row=LIGNE_DEBUT_SAISIE, values_only=True), start=LIGNE_DEBUT_SAISIE):
-        # A N° | B Date | C Code | D Désignation | E Qté | F Prix catalogue | G Prix pratiqué | H Total | I Vendeur | J Client
-        _, date, code, _, qte, _, prix_prat, _, vendeur, client = (list(r) + [None] * 11)[:10]
-        code = str(code or "").strip().upper()
-        if not code and not qte:
+        # Format actuel : A N° | B Date | C Produit | D Code SKU (auto) | E Qté | F Prix cat. | G Prix pratiqué
+        #                 | H Total | I Vendeur | J Client
+        _, date, c3, c4, qte, _, prix_prat, _, vendeur, client = (list(r) + [None] * 11)[:10]
+        if ancien_format:
+            code, nom = str(c3 or "").strip().upper(), ""
+        else:
+            nom = str(c3 or "").strip()
+            code = par_nom.get(normaliser(nom)) or str(c4 or "").strip().upper()   # le nom fait foi
+        if not (nom or code) and not qte:
+            continue
+        if code not in produits and nom:
+            anomalies.append(Anomalie(cfg.f_vendeur.name, n, f"Produit non reconnu « {nom} » : choisissez-le dans la liste"))
             continue
         cle = str(n)
         q = nombre(qte)

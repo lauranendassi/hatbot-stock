@@ -75,6 +75,7 @@ def traiter(psid: str, texte: str) -> list[str]:
     historique.append({"role": "user", "contenu": texte})
     conv["_hist"] = historique
     profil = conv["profil"]
+    nouvelle_visite(conv)
     if not profil.get("prenom_cherche"):
         profil["prenom"] = messenger.prenom(psid)
         profil["prenom_cherche"] = True
@@ -92,6 +93,26 @@ def traiter(psid: str, texte: str) -> list[str]:
     log.info("[%s] ⏱ %.1fs au total (base : lecture %.2fs, écriture %.2fs | IA %.1fs)", psid[-6:],
              time.perf_counter() - debut, t_lecture, t_ecriture, ia.DUREE_CUMULEE)
     return reponses
+
+
+CLES_SESSION = ("nb_demandes_prix", "champ_attendu", "derniere_question", "attente_oui", "attente_photo",
+                "attente_commande", "produit_focus", "categorie_focus", "categorie_refusee", "negociation",
+                "prix_connus")
+
+
+def nouvelle_visite(conv: dict, heures: float = 6):
+    """Un client qui revient après plusieurs heures recommence une discussion neuve : on garde ce qu'on sait
+    de lui (prénom, usages, budget, nom, téléphone, commandes) mais pas l'état de la discussion d'avant."""
+    derniere = conv["profil"].get("derniere_interaction")
+    try:
+        ecart = (dt.datetime.now() - dt.datetime.fromisoformat(derniere)).total_seconds() / 3600 if derniere else 0
+    except ValueError:
+        ecart = 0
+    if ecart >= heures and conv["etat"] not in ("HUMAIN",):
+        for cle in CLES_SESSION:
+            conv["profil"].pop(cle, None)
+        conv["etat"], conv["panier"] = "CONVERSATION", {}
+        log.info("[%s] nouvelle visite (%.0f h après) : discussion remise à zéro", conv["psid"][-6:], ecart)
 
 
 def _traiter(conv: dict, role: str, texte: str) -> list[str]:
@@ -178,6 +199,15 @@ def _traiter(conv: dict, role: str, texte: str) -> list[str]:
         return photo(conv)
     if a.principale == "NEGOCIATION" or (a.principale == "PRIX" and a.offre and profil.get("produit_focus")):
         return negocier(conv, role, a, texte)
+    # « 320000 ? », « et à 320 ? » : un montant seul, juste après avoir annoncé le prix du produit
+    focus = profil.get("produit_focus")
+    if focus and focus in (profil.get("prix_connus") or []) and a.principale in ("AUTRE", "PRIX", "NON"):
+        p = catalogue.par_code(focus)
+        offres = [o for o in intentions.montants(sans_accents(texte), True)
+                  if p and 0.5 * float(p["prix_vente"]) <= o < float(p["prix_vente"])]
+        if offres and len(texte) <= 60:
+            a.offre, a.principale = offres[0], "NEGOCIATION"
+            return negocier(conv, role, a, texte)
     return conseiller(conv, role, texte, a)
 
 
@@ -217,8 +247,11 @@ def mettre_a_jour_profil(profil: dict, a: intentions.Analyse, texte: str):
         profil["pour_qui"] = a.pour_qui
     if a.telephone:
         profil["telephone"] = a.telephone
-    if "PRIX" in a.toutes:
-        profil["nb_demandes_prix"] = int(profil.get("nb_demandes_prix", 0)) + 1
+    if "PRIX" in a.toutes or "NEGOCIATION" in a.toutes:
+        # 1re demande : 1. Redemande juste après notre question de découverte : 2 (= insistance).
+        profil["nb_demandes_prix"] = int(profil.get("nb_demandes_prix", 0)) + 1 if attendu else 1
+    elif attendu:
+        profil["nb_demandes_prix"] = 0                 # il a répondu à la question : on repart de zéro
 
 
 def resume_profil(profil: dict) -> str:
@@ -299,6 +332,8 @@ def conseiller(conv: dict, role: str, texte: str, a: intentions.Analyse) -> list
             profil["produit_focus"] = None
         elif items:                                           # produit dont on parle : pour « je le prends »,
             profil["produit_focus"] = items[0]["code"]        # la photo, la négociation
+        connus = profil.setdefault("prix_connus", [])
+        connus.extend(i["code"] for i in items if i["code"] not in connus)
         directive.append(
             "Le besoin est clair : recommande 1 ou 2 produits MAXIMUM parmi les résultats du système. "
             "Convaincs avec honnêteté : 2 bénéfices concrets pour SON usage (pas une liste de caractéristiques), "
@@ -666,6 +701,9 @@ def negocier(conv, role, a, texte, code=None) -> list[str]:
     if not r.get("ok"):
         return ["Pour quel modèle exactement souhaitez-vous un prix ?"]
     etats[code] = r["etat"]
+    connus = profil.setdefault("prix_connus", [])
+    if code not in connus:
+        connus.append(code)
     p = catalogue.par_code(code)
     prix, catalogue_prix, decision = r["prix"], r["prix_catalogue"], r["decision"]
     stock = executer("verifier_stock", {"code": code})
@@ -738,26 +776,37 @@ def nom_court(designation: str) -> str:
 
 
 def message_negociation(n: dict) -> str:
-    prix, nom = fcfa(n["prix"]), nom_court(n["nom"])
+    import random
+    prix, nom, cat = fcfa(n["prix"]), nom_court(n["nom"]), fcfa(n["prix_catalogue"])
     usages = [USAGES_TEXTE[u] for u in n.get("usages_client") or [] if u in USAGES_TEXTE]
-    arg = (f" Pour {' et '.join(usages[:2])}, c'est vraiment un excellent choix." if usages else
-           " C'est une machine fiable, vous ne serez pas déçu.")
+    pour = f"pour {' et '.join(usages[:2])}" if usages else "pour votre usage"
     alt = n.get("alternative")
-    alt_txt = (f" Si c'est encore trop, le {nom_court(alt['designation'])} est à {fcfa(alt['prix_vente'])}." if alt else "")
-    return {
-        "deja_moins_cher": f"Bonne nouvelle : le {nom} est déjà à {prix}, c'est même moins que ce que vous proposiez ! "
-                           "Je vous le réserve ?",
-        "accepte": f"Allez, c'est d'accord pour {prix} ! Vous faites une très bonne affaire sur le {nom}. "
-                   "Je vous le réserve à ce prix ?",
-        "contre_offre": f"Je comprends, et j'ai envie de vous faire plaisir.{arg} Ce que je peux faire pour vous, "
-                        f"c'est {prix} au lieu de {fcfa(n['prix_catalogue'])}. On part là-dessus ?",
-        "dernier_prix": f"J'ai vraiment fait le maximum : {prix}, c'est mon dernier prix pour le {nom}.{alt_txt} "
-                        "Je vous le réserve ?",
-        "prix_ferme": f"Le {nom} est déjà à son prix le plus juste, {prix}, je ne peux pas descendre davantage.{alt_txt} "
-                      "Voulez-vous le réserver ?",
-        "deja_au_prix": f"Nous sommes déjà d'accord sur {prix}, c'est le meilleur prix possible pour le {nom}. "
-                        "Je vous le réserve ?",
-    }[n["decision"]]
+    alt_txt = (f" Si c'est encore trop pour vous, le {nom_court(alt['designation'])} est à {fcfa(alt['prix_vente'])}."
+               if alt else "")
+    variantes = {
+        "deja_moins_cher": [f"Bonne nouvelle : le {nom} est déjà à {prix}, c'est même moins que ce que vous proposiez ! "
+                            "Je vous le réserve ?"],
+        "accepte": [f"Allez, c'est d'accord pour {prix} ! Vous faites une très bonne affaire sur le {nom}. "
+                    "Je vous le réserve à ce prix ?",
+                    f"Marché conclu : {prix} pour le {nom}, c'est un très bon prix. On passe à la réservation ?",
+                    f"Vous savez négocier ! Va pour {prix}. Je vous le mets de côté ?"],
+        "contre_offre": [f"Je comprends, tout le monde aime faire une bonne affaire. Le {nom} est un excellent choix {pour}. "
+                         f"Ce que je peux faire pour vous, c'est {prix} au lieu de {cat}. On part là-dessus ?",
+                         f"Je vois que le {nom} vous plaît, et il le mérite {pour}. Je fais un geste : {prix} "
+                         f"au lieu de {cat}. Ça vous va ?",
+                         f"D'accord, je fais un effort pour vous : {prix} au lieu de {cat}. C'est vraiment un bon prix "
+                         f"pour un {nom}. On conclut ?"],
+        "dernier_prix": [f"Là, j'ai vraiment fait le maximum : {prix}, c'est mon dernier prix pour le {nom}.{alt_txt} "
+                         "Je vous le réserve ?",
+                         f"Je ne peux pas descendre plus bas que {prix} pour le {nom}, c'est mon dernier mot.{alt_txt} "
+                         "On le prend ?"],
+        "prix_ferme": [f"Le {nom} est déjà à son prix le plus juste, {prix} : je ne peux pas descendre davantage.{alt_txt} "
+                       "Voulez-vous le réserver ?"],
+        "deja_au_prix": [f"Nous sommes déjà d'accord sur {prix}, c'est le meilleur prix possible pour le {nom}. "
+                         "Je vous le réserve ?"],
+    }
+    return random.choice(variantes[n["decision"]])
+
 
 # ==========================================================================
 # Humain, SAV, photo

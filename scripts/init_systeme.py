@@ -25,7 +25,8 @@ import sys
 
 from openpyxl import Workbook
 
-from common import (DOSSIER_DATA, DOSSIER_SAUV, F_SAISIE_ACHATS, F_SAISIE_VENTES, ouvrir_classeur,
+from common import (DOSSIER_DATA, DOSSIER_SAUV, F_SAISIE_ACHATS, F_SAISIE_VENTES, LIGNE_DEBUT_SAISIE,
+                    ouvrir_classeur,
                     charger_config, charger_produits, calculer_stocks, enregistrer_classeur)
 from classeurs import creer_fichier_achats, creer_fichier_vendeur, entetes, largeurs
 
@@ -70,10 +71,31 @@ def format_actuel(chemin, cfg) -> bool:
     try:
         wb = ouvrir_classeur(chemin, cfg.mdp_admin, read_only=True)
         ok = attendu in wb.sheetnames
+        if ok and chemin == cfg.f_vendeur:                    # saisie par désignation (liste déroulante) ?
+            entete = next(wb[attendu].iter_rows(min_row=4, max_row=4, values_only=True))[2]
+            ok = str(entete or "").lower().startswith("produit")
         wb.close()
         return ok
     except Exception:
         return False
+
+
+def ventes_anciennes(chemin, produits) -> list[tuple]:
+    """Récupère les ventes déjà saisies dans un ancien fichier vendeur (code en colonne C)."""
+    lignes = []
+    try:
+        wb = ouvrir_classeur(chemin, data_only=True, read_only=True)
+        ws = wb[F_SAISIE_VENTES]
+        par_code = {p.code: p.designation for p in produits}
+        for r in ws.iter_rows(min_row=LIGNE_DEBUT_SAISIE, values_only=True):
+            _, date, code, _, qte, _, prix, _, vendeur, client = (list(r) + [None] * 11)[:10]
+            code = str(code or "").strip().upper()
+            if code or qte:
+                lignes.append((date, par_code.get(code, code), qte, prix, vendeur, client))
+        wb.close()
+    except Exception as e:
+        print(f"   (ventes de l'ancien fichier non récupérées : {e})")
+    return lignes
 
 
 def sauvegarder(chemin, suffixe=""):
@@ -109,6 +131,7 @@ def main():
     etats = calculer_stocks(produits, [], [])
     maj = dt.datetime.now().strftime("%d/%m/%Y %H:%M")
 
+    a_reprendre = []
     for chemin, fabrique in ((cfg.f_vendeur, lambda: creer_fichier_vendeur(cfg, produits, etats, maj)),
                              (cfg.f_achats, lambda: creer_fichier_achats(cfg, produits))):
         if chemin.exists() and not args.force:
@@ -116,14 +139,21 @@ def main():
                 print(f"• {chemin.name} existe déjà (inchangé — utilisez --force pour le recréer)")
                 continue
             print(f"• {chemin.name} est un ancien fichier (autre structure) : mis de côté puis recréé")
-            sauvegarder(chemin, "ancien_format")
             if chemin == cfg.f_vendeur:
-                (DOSSIER_DATA / "journal_ventes.json").unlink(missing_ok=True)
+                a_reprendre = ventes_anciennes(chemin, produits)
+            sauvegarder(chemin, "ancien_format")
         if args.force:
             sauvegarder(chemin)
             if chemin == cfg.f_vendeur:
                 (DOSSIER_DATA / "journal_ventes.json").unlink(missing_ok=True)
-        enregistrer_classeur(fabrique(), chemin)
+        wb = fabrique()
+        if chemin == cfg.f_vendeur and a_reprendre:
+            ws = wb[F_SAISIE_VENTES]
+            for i, (d, nom, q, prix, vend, cli) in enumerate(a_reprendre, start=LIGNE_DEBUT_SAISIE):
+                for col, val in ((2, d), (3, nom), (5, q), (7, prix), (9, vend), (10, cli)):
+                    ws.cell(row=i, column=col, value=val)
+            print(f"   {len(a_reprendre)} vente(s) déjà saisie(s) reprise(s) dans le nouveau fichier")
+        enregistrer_classeur(wb, chemin)
         print(f"✔ {chemin.name} créé")
 
     if not (DOSSIER_DATA / "etat_sync.json").exists():          # 1re installation : on garde les anciens

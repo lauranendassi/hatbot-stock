@@ -22,8 +22,14 @@ if errorlevel 1 echo  (Info) Tache au demarrage non creee : droits administrateu
 REM Reglages : fonctionne sur batterie, rattrape les passages manques, 4 min max, jamais 2 en meme temps
 powershell -NoProfile -Command "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 4) -MultipleInstances IgnoreNew; Set-ScheduledTask -TaskName 'WeloobeAI_Synchro_Stock' -Settings $s | Out-Null; Set-ScheduledTask -TaskName 'WeloobeAI_Synchro_Stock_Demarrage' -Settings $s -ErrorAction SilentlyContinue | Out-Null"
 
-schtasks /Run /TN "WeloobeAI_Synchro_Stock" >nul
+REM --- Surveillance en continu (mise a jour ~10 s apres chaque Ctrl+S), lancee a chaque ouverture de Windows.
+REM     Raccourci dans le dossier Demarrage de l'utilisateur : aucun droit administrateur requis.
+powershell -NoProfile -Command "$w = New-Object -ComObject WScript.Shell; $l = $w.CreateShortcut([Environment]::GetFolderPath('Startup') + '\WeloobeAI_Surveillance_Stock.lnk'); $l.TargetPath = '%PYW%'; $l.Arguments = '\"%~dp0scripts\surveiller.py\"'; $l.WorkingDirectory = '%~dp0'; $l.WindowStyle = 7; $l.Description = 'Mise a jour automatique du stock WeloobeAI'; $l.Save()"
+start "" "%PYW%" "%~dp0scripts\surveiller.py"
 echo.
-echo  Synchronisation automatique programmee (toutes les 5 min + a l'ouverture de session).
+echo  Mise a jour automatique ACTIVE :
+echo   - environ 10 secondes apres chaque enregistrement (Ctrl+S) d'un fichier de saisie
+echo   - et par securite toutes les 5 minutes
+echo  Elle redemarre toute seule a chaque ouverture de Windows. Plus besoin de sync_stock.bat.
 echo  Verification : Planificateur de taches ^> Bibliotheque ^> WeloobeAI_Synchro_Stock
 echo  Journal : %~dp0logs\sync.log
