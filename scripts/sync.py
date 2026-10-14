@@ -90,7 +90,10 @@ def synchroniser(forcer: bool = False) -> int:
                 etat[cle] = cibles[cle]
                 log.info("✔ %s mis à jour", fichier.name)
             except FichierVerrouille:
-                log.info("⏸ %s est ouvert dans Excel : mise à jour reportée au prochain passage", fichier.name)
+                log.info("⏸ %s est ouvert dans Excel : mise à jour reportée au prochain passage "
+                         "(fermez-le pour qu'il se mette à jour)", fichier.name)
+            except Exception:                  # une erreur sur un fichier ne doit pas bloquer les autres
+                log.exception("✘ %s n'a pas pu être mis à jour", fichier.name)
 
         ecrire("ventes", cfg.f_ventes, lambda: classeurs.creer_fichier_ventes(cfg, produits, ventes, maj))
         ecrire("admin", cfg.f_admin,

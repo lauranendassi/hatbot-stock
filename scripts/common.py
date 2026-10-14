@@ -151,7 +151,17 @@ def est_ouvert_dans_excel(chemin: Path) -> bool:
         return False
     proprietaire = chemin.with_name("~$" + chemin.name)
     if proprietaire.exists():
-        return True
+        # Excel garde ce petit fichier ouvert (verrouillé) tant que le classeur est ouvert.
+        # S'il n'est pas verrouillé, c'est un reste d'Excel fermé brutalement : on le supprime.
+        try:
+            with open(proprietaire, "r+b"):
+                pass
+            os.remove(proprietaire)
+            logging.getLogger("sync").info("Fichier verrou orphelin supprimé : %s", proprietaire.name)
+        except PermissionError:
+            return True                       # verrouillé : le classeur est vraiment ouvert
+        except OSError:
+            pass
     try:
         with open(chemin, "r+b"):
             pass
